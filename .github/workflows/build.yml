@@ -41,17 +41,16 @@ jobs:
       - name: Install & Bundle mavp2p (macOS / Linux)
         if: matrix.os != 'windows-latest'
         run: |
-          go install github.com/bluenviron/mavp2p@latest
           mkdir -p resources/bin
-          cp "$(go env GOPATH)/bin/mavp2p" resources/bin/
+          GOBIN="$(pwd)/resources/bin" go install github.com/bluenviron/mavp2p@latest
 
       - name: Install & Bundle mavp2p (Windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
-          go install github.com/bluenviron/mavp2p@latest
           New-Item -ItemType Directory -Force -Path resources/bin
-          Copy-Item "$env:GOPATH\bin\mavp2p.exe" -Destination resources/bin\mavp2p.exe
+          $env:GOBIN = "$(Get-Location)/resources/bin"
+          go install github.com/bluenviron/mavp2p@latest
 
       - name: Set up Python
         uses: actions/setup-python@v5

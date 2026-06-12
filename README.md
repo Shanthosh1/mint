@@ -108,7 +108,7 @@ MINT is configured with a GitHub Actions pipeline ([.github/workflows/build.yml]
 
 ## 🤖 AI Credits & Disclaimer
 
-This application was developed with the assistance of advanced agentic AI coding assistants (specifically Google DeepMind's **Antigravity** pairing agent). The AI played a central role in constructing telemetry parsing engines, implementing real-time analytical math functions (such as live NRMSE and FFT spectral calculations), building the React glassmorphic interface, and configuring the multi-platform PyInstaller CI/CD pipeline.
+This application was developed with the assistance of agentic AI coding tools. AI assistance was primarily utilized to accelerate React frontend development and optimize overall coding standards and patterns across the codebase.
 
 ---
 

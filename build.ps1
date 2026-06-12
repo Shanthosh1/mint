@@ -34,6 +34,24 @@ if (Test-Path -Path ".venv") {
 Write-Host "✓ Installing Python dependencies..."
 & .venv\Scripts\python -m pip install -r requirements.txt
 
+# Verify / Build Telemetry Router Binary
+Write-Host ""
+Write-Host "👉 Verify Telemetry Router Binary..." -ForegroundColor Yellow
+if (-not (Test-Path -Path "resources/bin\mavp2p.exe")) {
+    Write-Host "⚠ Telemetry router binary (resources\bin\mavp2p.exe) not found." -ForegroundColor Yellow
+    if (Get-Command go -ErrorAction SilentlyContinue) {
+        Write-Host "✓ Go compiler detected. Compiling mavp2p automatically..." -ForegroundColor Green
+        New-Item -ItemType Directory -Force -Path resources/bin
+        $env:GOBIN = "$(Get-Location)/resources/bin"
+        go install github.com/bluenviron/mavp2p@latest
+    } else {
+        Write-Host "❌ Error: Go compiler not found. Please install Go or manually place the mavp2p.exe binary in resources\bin\." -ForegroundColor Red
+        Exit 1
+    }
+} else {
+    Write-Host "✓ Telemetry router binary found in resources/bin\." -ForegroundColor Green
+}
+
 # 3. Package with PyInstaller
 Write-Host ""
 Write-Host "👉 Step 3: Compiling single-folder executable..." -ForegroundColor Yellow

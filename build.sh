@@ -35,6 +35,23 @@ fi
 echo "✓ Installing Python dependencies..."
 .venv/bin/python -m pip install -r requirements.txt
 
+# Verify / Build Telemetry Router Binary
+echo ""
+echo "👉 Verify Telemetry Router Binary..."
+if [ ! -f "resources/bin/mavp2p" ]; then
+    echo "⚠ Telemetry router binary (resources/bin/mavp2p) not found."
+    if command -v go &> /dev/null; then
+        echo "✓ Go compiler detected. Compiling mavp2p automatically..."
+        mkdir -p resources/bin
+        GOBIN="$(pwd)/resources/bin" go install github.com/bluenviron/mavp2p@latest
+    else
+        echo "❌ Error: Go compiler not found. Please install Go or manually place the mavp2p binary in resources/bin/."
+        exit 1
+    fi
+else
+    echo "✓ Telemetry router binary found in resources/bin/."
+fi
+
 # 3. Package with PyInstaller
 echo ""
 echo "👉 Step 3: Compiling single-folder executable..."
