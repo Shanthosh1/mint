@@ -1,0 +1,181 @@
+/* ==========================================================================
+   MINT — dark glassmorphism theme
+   ========================================================================== */
+:root {
+  --bg-0: #070b14;
+  --bg-1: #0c1322;
+  --glass: rgba(255, 255, 255, 0.055);
+  --glass-strong: rgba(255, 255, 255, 0.09);
+  --glass-border: rgba(255, 255, 255, 0.12);
+  --text-hi: #eaf0ff;
+  --text-mid: #9aa7c2;
+  --text-lo: #5e6a85;
+  --accent: #4f8cff;
+  --accent-glow: rgba(79, 140, 255, 0.35);
+  --ok: #34d399;
+  --warn: #fbbf24;
+  --crit: #f87171;
+  --radius: 16px;
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: 'Inter', system-ui, sans-serif;
+  color: var(--text-hi);
+  background:
+    radial-gradient(1100px 600px at 12% -8%, rgba(79, 140, 255, 0.16), transparent 60%),
+    radial-gradient(900px 500px at 95% 15%, rgba(167, 90, 255, 0.12), transparent 55%),
+    radial-gradient(700px 700px at 50% 110%, rgba(52, 211, 153, 0.07), transparent 60%),
+    linear-gradient(160deg, var(--bg-0), var(--bg-1));
+  min-height: 100vh;
+}
+
+/* ---- glass panels -------------------------------------------------------- */
+.glass {
+  background: var(--glass);
+  backdrop-filter: blur(18px) saturate(140%);
+  -webkit-backdrop-filter: blur(18px) saturate(140%);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35),
+              inset 0 1px 0 rgba(255, 255, 255, 0.06);
+}
+
+.panel { padding: 18px 20px; }
+.panel h2 {
+  margin: 0 0 14px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-mid);
+}
+
+/* ---- layout (fluid: fills any screen, collapses gracefully) -------------- */
+.app-shell {
+  width: 100%;
+  min-height: 100vh;
+  padding: clamp(12px, 1.5vw, 28px);
+}
+.topbar {
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  padding: 14px clamp(14px, 1.5vw, 24px); margin-bottom: 18px;
+}
+.topbar .logo { font-weight: 700; font-size: 1.15rem; letter-spacing: 0.02em; }
+.topbar .logo span { color: var(--accent); }
+.grid {
+  display: grid; gap: clamp(12px, 1.2vw, 20px);
+  /* Side columns scale with the viewport, center takes the rest.
+     minmax(0, …) lets uPlot shrink instead of overflowing. */
+  grid-template-columns:
+    minmax(280px, 22vw) minmax(0, 1fr) minmax(300px, 26vw);
+  align-items: start;
+}
+.col { display: flex; flex-direction: column; gap: clamp(12px, 1.2vw, 20px); min-width: 0; }
+/* Mid-size screens: charts keep the full row, side panels pair up below. */
+@media (max-width: 1280px) {
+  .grid { grid-template-columns: 1fr 1fr; }
+  .col-main { grid-column: 1 / -1; grid-row: 1; }
+}
+@media (max-width: 760px) {
+  .grid { grid-template-columns: 1fr; }
+  .col-main { grid-column: auto; grid-row: auto; }
+}
+
+/* ---- controls ------------------------------------------------------------ */
+.btn {
+  font: inherit; cursor: pointer;
+  color: var(--text-hi);
+  background: var(--glass-strong);
+  border: 1px solid var(--glass-border);
+  border-radius: 10px;
+  padding: 8px 14px;
+  transition: all 0.15s ease;
+}
+.btn:hover { border-color: var(--accent); box-shadow: 0 0 14px var(--accent-glow); }
+.btn:disabled { opacity: 0.4; cursor: not-allowed; box-shadow: none; }
+.btn.primary { background: linear-gradient(135deg, #3b6fe0, #4f8cff); border: none; }
+.btn.danger  { background: linear-gradient(135deg, #c2410c, #f87171); border: none; }
+.btn.approve { background: linear-gradient(135deg, #047857, #34d399); border: none; font-weight: 600; }
+.btn.mode-active { border-color: var(--accent); box-shadow: 0 0 14px var(--accent-glow); color: var(--accent); }
+
+select, input[type="text"] {
+  font: inherit; color: var(--text-hi);
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid var(--glass-border);
+  border-radius: 10px; padding: 8px 12px; width: 100%;
+}
+
+/* ---- status / badges ------------------------------------------------------ */
+.badge {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 0.72rem; font-weight: 600;
+  padding: 4px 10px; border-radius: 999px;
+  background: var(--glass-strong); border: 1px solid var(--glass-border);
+}
+.dot { width: 8px; height: 8px; border-radius: 50%; }
+.dot.ok { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+.dot.off { background: var(--text-lo); }
+.dot.warn { background: var(--warn); box-shadow: 0 0 8px var(--warn); }
+.dot.crit { background: var(--crit); box-shadow: 0 0 8px var(--crit); animation: pulse 1s infinite; }
+@keyframes pulse { 50% { opacity: 0.4; } }
+
+.mono { font-family: var(--font-mono); font-size: 0.85rem; }
+.muted { color: var(--text-mid); font-size: 0.82rem; }
+.row { display: flex; align-items: center; gap: 10px; }
+.spread { justify-content: space-between; }
+.stack { display: flex; flex-direction: column; gap: 10px; }
+
+/* ---- EKF gauges ------------------------------------------------------------ */
+.gauge { margin-bottom: 12px; }
+.gauge-track {
+  height: 8px; border-radius: 999px;
+  background: rgba(0, 0, 0, 0.4); overflow: hidden;
+  position: relative;
+}
+.gauge-fill { height: 100%; border-radius: 999px; transition: width 0.3s, background 0.3s; }
+.gauge-fill.ok   { background: linear-gradient(90deg, #10b981, #34d399); }
+.gauge-fill.warn { background: linear-gradient(90deg, #d97706, #fbbf24); }
+.gauge-fill.crit { background: linear-gradient(90deg, #dc2626, #f87171); box-shadow: 0 0 12px var(--crit); }
+.gauge-gate { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--crit); opacity: 0.7; }
+
+/* ---- alerts / prompts ------------------------------------------------------ */
+.alert {
+  padding: 10px 14px; border-radius: 12px;
+  font-size: 0.85rem; border: 1px solid;
+  animation: slide-in 0.25s ease;
+}
+.alert.info     { border-color: rgba(79,140,255,0.4);  background: rgba(79,140,255,0.08); }
+.alert.warning  { border-color: rgba(251,191,36,0.4);  background: rgba(251,191,36,0.08); }
+.alert.critical { border-color: rgba(248,113,113,0.5); background: rgba(248,113,113,0.10); }
+.pilot-prompt {
+  border: 1px solid rgba(79,140,255,0.5);
+  background: rgba(79,140,255,0.12);
+  padding: 14px; border-radius: 12px;
+  font-weight: 600; box-shadow: 0 0 24px var(--accent-glow);
+  animation: slide-in 0.25s ease;
+}
+@keyframes slide-in { from { transform: translateY(-6px); opacity: 0; } }
+
+/* ---- proposals -------------------------------------------------------------- */
+.proposal { padding: 14px; border-radius: 12px; background: rgba(0,0,0,0.25);
+            border: 1px solid var(--glass-border); }
+.proposal .delta { font-family: var(--font-mono); font-size: 1.0rem; }
+.proposal .arrow { color: var(--accent); margin: 0 8px; }
+
+/* ---- uPlot dark overrides ----------------------------------------------------- */
+.uplot { font-family: 'Inter', sans-serif !important; }
+.u-legend { color: var(--text-mid) !important; font-size: 0.75rem !important; }
+.u-axis { color: var(--text-lo); }
+
+/* ---- upload drop zone ----------------------------------------------------------- */
+.dropzone {
+  border: 2px dashed var(--glass-border); border-radius: var(--radius);
+  padding: 28px; text-align: center; color: var(--text-mid);
+  cursor: pointer; transition: all 0.2s;
+}
+.dropzone.active, .dropzone:hover { border-color: var(--accent); color: var(--text-hi);
+  background: rgba(79,140,255,0.06); }

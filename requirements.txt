@@ -1,0 +1,20 @@
+# MINT backend dependencies (Python >= 3.10)
+fastapi>=0.110
+uvicorn[standard]>=0.29
+websockets>=12.0
+python-multipart>=0.0.9     # UploadFile support
+pydantic>=2.6
+
+# Telemetry
+mavsdk>=2.0
+pymavlink>=2.4.40
+pyserial>=3.5
+
+# Log processing
+pyulog>=1.0.2
+pandas>=2.1
+numpy>=1.26
+scipy>=1.12
+
+# Packaging
+pyinstaller>=6.4
