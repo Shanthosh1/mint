@@ -35,12 +35,23 @@ async def telemetry_socket(ws: WebSocket) -> None:
     downsampler = Downsampler()
     log.info("WS client connected: %s", ws.client)
     try:
+        # Replay current state so a (re)connecting tab paints immediately
+        # instead of waiting for the next live sample on each channel.
+        for event in HUB.latest_snapshot():
+            await ws.send_text(json.dumps({
+                "ch": event.channel,
+                "t": event.ts,
+                "ts": event.ts_epoch,
+                "d": event.payload,
+                "replay": True,
+            }))
         async for event in HUB.subscribe():
             if event.channel not in _PASSTHROUGH and not downsampler.admit(event.channel):
                 continue
             await ws.send_text(json.dumps({
                 "ch": event.channel,
                 "t": event.ts,
+                "ts": event.ts_epoch,
                 "d": event.payload,
             }))
     except WebSocketDisconnect:

@@ -97,6 +97,14 @@ class ParamAdvisor:
         Re-validates against the live on-vehicle value before dispatching —
         if anything moved (e.g. pilot changed it in QGC meanwhile), the
         write is blocked and the proposal flips to REJECTED.
+
+        Accepted race: there is a sub-millisecond window between this re-read
+        and the write in which another GCS could change the parameter, so the
+        write would commit against a just-stale validation. This is tolerated
+        rather than fixed — MAVSDK exposes no compare-and-set param API, and
+        the safety registry's per-write `max_step` clamp bounds the worst-case
+        movement regardless, so a lost race can never produce a catastrophic
+        value (only a slightly-off-from-intended one against the new baseline).
         """
         prop = self._proposals.get(proposal_id)
         if prop is None:

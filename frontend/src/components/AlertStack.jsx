@@ -1,9 +1,18 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { api } from '../api.js';
 import { useTelemetryChannel } from '../hooks/useTelemetry.js';
 
 const MAX_ALERTS = 6;
 const MAX_RECOS = 4;
+
+/** "just now" / "12s ago" / "3m ago" from an epoch-ms timestamp. */
+function timeAgo(epochMs, nowMs) {
+  const s = Math.max(0, Math.round((nowMs - epochMs) / 1000));
+  if (s < 3) return 'just now';
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  return `${Math.floor(s / 3600)}h ago`;
+}
 
 /**
  * Rolling alert feed + pilot step-input prompt + live tuning advice.
@@ -18,10 +27,20 @@ export default function AlertStack() {
   const [recos, setRecos] = useState([]);
   const [prompt, setPrompt] = useState(null);
   const [error, setError] = useState(null);
+  const [now, setNow] = useState(Date.now());
 
-  useTelemetryChannel('alert', (d) => {
+  // Tick so the relative "Xs ago" labels stay current without new events.
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  useTelemetryChannel('alert', (d, _t, _ch, ts) => {
+    // ts is the server wall-clock (epoch seconds); fall back to the client
+    // clock if a frame predates the timestamped protocol.
+    const atMs = ts != null ? ts * 1000 : Date.now();
     setAlerts((prev) =>
-      [{ ...d, id: Date.now() + Math.random() }, ...prev].slice(0, MAX_ALERTS));
+      [{ ...d, id: Date.now() + Math.random(), atMs }, ...prev].slice(0, MAX_ALERTS));
   });
 
   useTelemetryChannel('recommendation', (d) => {
@@ -94,7 +113,10 @@ export default function AlertStack() {
         )}
         {alerts.map((a) => (
           <div key={a.id} className={`alert ${a.severity || 'info'}`}>
-            {a.source && <strong style={{ textTransform: 'uppercase', fontSize: '0.7rem', marginRight: 8 }}>{a.source}</strong>}
+            <div className="row spread">
+              {a.source && <strong style={{ textTransform: 'uppercase', fontSize: '0.7rem' }}>{a.source}</strong>}
+              {a.atMs && <span className="muted" style={{ fontSize: '0.7rem' }}>{timeAgo(a.atMs, now)}</span>}
+            </div>
             {a.text}
           </div>
         ))}

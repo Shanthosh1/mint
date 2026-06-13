@@ -19,9 +19,10 @@ function ensureSocket(setConnected) {
 
   socket.onopen = () => setConnected?.(true);
   socket.onmessage = (e) => {
-    const { ch, t, d } = JSON.parse(e.data);
-    listeners.get(ch)?.forEach((fn) => fn(d, t));
-    listeners.get('*')?.forEach((fn) => fn(d, t, ch));
+    const { ch, t, ts, d } = JSON.parse(e.data);
+    // t = server monotonic (ordering only); ts = wall-clock epoch seconds.
+    listeners.get(ch)?.forEach((fn) => fn(d, t, ch, ts));
+    listeners.get('*')?.forEach((fn) => fn(d, t, ch, ts));
   };
   socket.onclose = () => {
     setConnected?.(false);

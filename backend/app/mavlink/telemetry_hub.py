@@ -25,7 +25,18 @@ from ..core import config
 class Event:
     channel: str                 # e.g. "attitude", "ekf", "advice", "alert"
     payload: dict[str, Any]
-    ts: float = field(default_factory=time.monotonic)
+    ts: float = field(default_factory=time.monotonic)        # monotonic, server-side
+    ts_epoch: float = field(default_factory=time.time)       # wall-clock for the UI
+
+
+# Channels whose latest value represents current *state* and is worth
+# replaying to a (re)connecting UI. Deliberately excludes event-like channels
+# (alert, pilot_prompt, proposal, param_written) — replaying those would
+# resurface notifications the pilot already saw or dismissed.
+_REPLAY_CHANNELS: frozenset[str] = frozenset({
+    "connection", "airframe", "regime", "flight_mode", "cascade_state",
+    "ekf_metrics", "loop_metrics", "vibration_metrics", "telemetry_stale",
+})
 
 
 class TelemetryHub:
@@ -40,12 +51,25 @@ class TelemetryHub:
         # staleness detection so consumers can tell "no fault" apart from
         # "the data stopped arriving" (dead router, FC stopped streaming).
         self._last_seen: dict[str, float] = {}
+        # Last event per *state-like* channel, kept so a freshly (re)connected
+        # WebSocket can replay current state instead of showing blank panels
+        # until the next sample arrives. Event-like channels (alerts, prompts)
+        # are NOT retained — replaying them would re-fire stale notifications.
+        self._latest: dict[str, Event] = {}
 
     def publish(self, channel: str, payload: dict[str, Any]) -> None:
         """Non-blocking publish; never raises on full queues."""
         event = Event(channel=channel, payload=payload)
         self._channel_counts[channel] += 1
         self._last_seen[channel] = event.ts
+        if channel in _REPLAY_CHANNELS:
+            # loop_metrics multiplexes rate/attitude/velocity/position over one
+            # channel via a "loop" field — sub-key so all loops replay, not
+            # just whichever published last.
+            key = channel
+            if channel == "loop_metrics":
+                key = f"loop_metrics:{payload.get('loop', '')}"
+            self._latest[key] = event
         for q in self._subscribers.values():
             if q.full():
                 try:
@@ -79,6 +103,14 @@ class TelemetryHub:
     def last_seen(self, channel: str) -> float | None:
         """Monotonic timestamp of the last publish on `channel`, or None."""
         return self._last_seen.get(channel)
+
+    def latest_snapshot(self) -> list[Event]:
+        """Most-recent event per replayable state channel, oldest first.
+
+        A (re)connecting WebSocket sends these before the live stream so the
+        UI paints current state immediately instead of blank panels.
+        """
+        return sorted(self._latest.values(), key=lambda e: e.ts)
 
     def stats(self) -> dict:
         return {

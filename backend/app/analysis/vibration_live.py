@@ -30,12 +30,15 @@ _VIB_WARN = 30.0
 _VIB_CRIT = 60.0
 _CLIP_WINDOW_S = 30.0       # recent clipping blocks tuning this long
 _ALERT_COOLDOWN_S = 30.0
+_STALE_S = 2.0             # VIBRATION gone this long mid-flight => fail safe
+_NEVER_STREAMED_S = 10.0   # never seen this long => assume link doesn't carry it
 
 
 class VibrationGate:
     def __init__(self) -> None:
         self._latest: dict = {}
         self._last_seen = 0.0
+        self._ever_seen = False
         self._last_clip_counts: tuple[int, int, int] | None = None
         self._last_clip_event = 0.0
         self._last_alert: dict[str, float] = {}
@@ -51,10 +54,23 @@ class VibrationGate:
 
     # ------------------------------------------------------------------ #
     def ok(self) -> bool:
-        """Safe to recommend raising gains? Open when no data streams."""
+        """Safe to recommend raising gains?
+
+        Staleness policy distinguishes "lost the signal" from "link never
+        carried it":
+          * Seen before, then silent > _STALE_S  -> fail safe (block advice).
+            Losing a vibration feed we were relying on is exactly when a
+            gain raise could be dangerous, so we refuse to vouch for it.
+          * Never seen for > _NEVER_STREAMED_S    -> open (don't block).
+            Many minimal-telemetry links simply don't stream VIBRATION;
+            treating its absence as "unsafe" would kill all gain advice.
+        """
         now = time.monotonic()
-        if now - self._last_seen > 10.0:
-            return True   # VIBRATION not streamed — do not block advice
+        age = now - self._last_seen
+        if self._ever_seen and age > _STALE_S:
+            return False  # had a feed, lost it — do not vouch for gain raises
+        if not self._ever_seen and age > _NEVER_STREAMED_S:
+            return True   # link never carries VIBRATION — do not block advice
         worst = max(self._latest.get(k, 0.0) for k in ("x", "y", "z"))
         recently_clipped = now - self._last_clip_event < _CLIP_WINDOW_S
         return worst < _VIB_WARN and not recently_clipped
@@ -68,6 +84,7 @@ class VibrationGate:
 
     def _process(self, p: dict, now: float) -> None:
         self._last_seen = now
+        self._ever_seen = True
         self._latest = {
             "x": float(p.get("vibration_x", 0) or 0),
             "y": float(p.get("vibration_y", 0) or 0),
