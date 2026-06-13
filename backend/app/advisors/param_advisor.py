@@ -35,6 +35,7 @@ class ProposalState(str, Enum):
     WRITTEN = "written"
     REJECTED = "rejected"
     FAILED = "write_failed"
+    REVERTED = "reverted"        # written, then rolled back to the pre-write value
 
 
 @dataclass
@@ -148,6 +149,53 @@ class ParamAdvisor:
         except Exception as exc:
             prop.state = ProposalState.FAILED
             prop.safety_note = f"Write failed: {exc}"
+        HUB.publish("proposal", asdict(prop))
+        return prop
+
+    # ------------------------------------------------------------------ #
+    async def revert(self, proposal_id: str) -> Proposal:
+        """Undo a written change: restore the parameter's pre-write value.
+
+        `current_value` is the live on-vehicle value captured at write time,
+        so reverting it rolls back exactly this one change (not any earlier
+        ones). Guarded by the same baseline check as a forward write: if the
+        live value no longer matches what MINT wrote, the parameter was
+        changed by someone else since (engine, pilot, QGC) and the revert is
+        blocked — silently writing the old value back would clobber that
+        newer change. Restoring a value that was live moments ago is itself
+        safe, but the write still goes through the single approved-write path
+        so the invariant ("one writer") and logging hold.
+        """
+        prop = self._proposals.get(proposal_id)
+        if prop is None:
+            raise KeyError(f"Unknown proposal {proposal_id}")
+        if prop.state != ProposalState.WRITTEN:
+            raise ValueError(
+                f"Proposal {proposal_id} is {prop.state}; only a written "
+                f"change can be reverted."
+            )
+
+        live = await CONNECTION.read_param(prop.param)
+        # Float params: compare with a relative tolerance so storage rounding
+        # doesn't read as tampering.
+        wrote = prop.proposed_value
+        tol = max(1e-6, abs(wrote) * 1e-3)
+        if abs(live - wrote) > tol:
+            raise ValueError(
+                f"{prop.param} is now {live:g}, not the {wrote:g} MINT wrote — "
+                f"it was changed since (engine, pilot, or QGC). Revert blocked "
+                f"so it can't clobber that newer value."
+            )
+
+        await CONNECTION.write_approved_param(
+            prop.param, prop.current_value,
+            as_int=REGISTRY.is_int(prop.airframe_class, prop.param),
+        )
+        prop.state = ProposalState.REVERTED
+        prop.safety_note = (
+            f"Reverted {prop.param} from {wrote:g} back to its pre-write "
+            f"value {prop.current_value:g}."
+        )
         HUB.publish("proposal", asdict(prop))
         return prop
 

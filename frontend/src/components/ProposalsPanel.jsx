@@ -37,6 +37,13 @@ export default function ProposalsPanel() {
     finally { refresh(); }
   };
 
+  const revert = async (id) => {
+    setBusyId(id); setError(null);
+    try { await api.revertProposal(id); }
+    catch (e) { setError(e.message); }
+    finally { setBusyId(null); refresh(); }
+  };
+
   // Compact "✓2 ✗1" track record for a proposal's prior history, if any.
   const historyLine = (h) => {
     if (!h || !h.total) return null;
@@ -63,6 +70,7 @@ export default function ProposalsPanel() {
     rejected: <span className="badge"><span className="dot crit" />safety rejected</span>,
     write_failed: <span className="badge"><span className="dot crit" />write failed</span>,
     approved: <span className="badge"><span className="dot warn" />writing…</span>,
+    reverted: <span className="badge"><span className="dot off" />reverted ↩</span>,
   })[p.state] ?? null;
 
   return (
@@ -106,25 +114,33 @@ export default function ProposalsPanel() {
               </>
             )}
             {p.state === 'written' && (
-              p.feedback ? (
-                <div className="muted" style={{ fontSize: '0.74rem', marginTop: 10 }}>
-                  Your verdict: <strong>{p.feedback.replace('_', ' ')}</strong> — thanks, logged for next time.
-                </div>
-              ) : (
-                <div style={{ marginTop: 10 }}>
-                  <div className="muted" style={{ fontSize: '0.74rem', marginBottom: 6 }}>
-                    How did it fly?
+              <div style={{ marginTop: 10 }}>
+                {p.feedback ? (
+                  <div className="muted" style={{ fontSize: '0.74rem' }}>
+                    Your verdict: <strong>{p.feedback.replace('_', ' ')}</strong> — thanks, logged for next time.
                   </div>
-                  <div className="row">
-                    {FEEDBACK.map(([value, label]) => (
-                      <button key={value} className="btn" style={{ flex: 1 }}
-                              onClick={() => giveFeedback(p.id, value)}>
-                        {label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              )
+                ) : (
+                  <>
+                    <div className="muted" style={{ fontSize: '0.74rem', marginBottom: 6 }}>
+                      How did it fly?
+                    </div>
+                    <div className="row">
+                      {FEEDBACK.map(([value, label]) => (
+                        <button key={value} className="btn" style={{ flex: 1 }}
+                                onClick={() => giveFeedback(p.id, value)}>
+                          {label}
+                        </button>
+                      ))}
+                    </div>
+                  </>
+                )}
+                <button className="btn" style={{ marginTop: 8, width: '100%' }}
+                        disabled={busyId === p.id}
+                        title={`Restore ${p.param} to its pre-write value ${p.current_value}`}
+                        onClick={() => revert(p.id)}>
+                  ↩ Undo (revert to {p.current_value})
+                </button>
+              </div>
             )}
           </div>
         ))}

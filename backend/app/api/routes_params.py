@@ -93,6 +93,25 @@ async def approve_proposal(proposal_id: str) -> dict:
             "safety_note": prop.safety_note}
 
 
+@router.post("/proposals/{proposal_id}/revert")
+async def revert_proposal(proposal_id: str) -> dict:
+    """Undo a written change — restore the parameter's pre-write value.
+
+    Blocked if the live value no longer matches what MINT wrote (something
+    changed it since). The only other write path besides Approve & Write.
+    """
+    try:
+        prop = await ADVISOR.revert(proposal_id)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc))
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
+    except ConnectionError as exc:
+        raise HTTPException(503, str(exc))
+    return {"id": prop.id, "state": prop.state, "reverted_to": prop.current_value,
+            "safety_note": prop.safety_note}
+
+
 @router.post("/proposals/{proposal_id}/feedback")
 def proposal_feedback(proposal_id: str, req: FeedbackRequest) -> dict:
     """Record the pilot's verdict on a written change (better/worse/no_change).

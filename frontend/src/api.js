@@ -32,6 +32,8 @@ export const api = {
     request(`/api/params/proposals/${id}/approve`, { method: 'POST' }),
   dismissProposal: (id) =>
     request(`/api/params/proposals/${id}`, { method: 'DELETE' }),
+  revertProposal: (id) =>
+    request(`/api/params/proposals/${id}/revert`, { method: 'POST' }),
   /** outcome: 'better' | 'worse' | 'no_change' */
   proposalFeedback: (id, outcome) =>
     request(`/api/params/proposals/${id}/feedback`, {
