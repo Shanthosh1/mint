@@ -30,6 +30,33 @@ export default function ProposalsPanel() {
     refresh();
   };
 
+  const giveFeedback = async (id, outcome) => {
+    setError(null);
+    try { await api.proposalFeedback(id, outcome); }
+    catch (e) { setError(e.message); }
+    finally { refresh(); }
+  };
+
+  // Compact "✓2 ✗1" track record for a proposal's prior history, if any.
+  const historyLine = (h) => {
+    if (!h || !h.total) return null;
+    const dir = h.direction === 'raise' ? 'Raising' : h.direction === 'lower' ? 'Lowering' : 'Changing';
+    return (
+      <div className="muted" style={{ fontSize: '0.74rem', marginTop: 6 }}>
+        📊 {dir} this on {h.airframe_class} before:{' '}
+        <span style={{ color: 'var(--ok)' }}>✓{h.better} better</span>{' · '}
+        <span style={{ color: 'var(--crit)' }}>✗{h.worse} worse</span>
+        {h.no_change ? <> · ∅{h.no_change} no change</> : null}
+      </div>
+    );
+  };
+
+  const FEEDBACK = [
+    ['better', 'better'],
+    ['worse', 'worse'],
+    ['no_change', 'no change'],
+  ];
+
   const stateBadge = (p) => ({
     presented: <span className="badge"><span className="dot warn" />awaiting pilot</span>,
     written: <span className="badge"><span className="dot ok" />written ✓</span>,
@@ -66,14 +93,38 @@ export default function ProposalsPanel() {
             <div className="muted" style={{ marginBottom: 6 }}>{p.rationale}</div>
             <div className="muted" style={{ fontSize: '0.74rem' }}>🛡 {p.safety_note}</div>
             {p.state === 'presented' && (
-              <div className="row" style={{ marginTop: 10 }}>
-                <button className="btn approve" style={{ flex: 1 }}
-                        disabled={busyId === p.id}
-                        onClick={() => approve(p.id)}>
-                  Approve &amp; Write
-                </button>
-                <button className="btn" onClick={() => dismiss(p.id)}>Dismiss</button>
-              </div>
+              <>
+                {historyLine(p.tuning_history)}
+                <div className="row" style={{ marginTop: 10 }}>
+                  <button className="btn approve" style={{ flex: 1 }}
+                          disabled={busyId === p.id}
+                          onClick={() => approve(p.id)}>
+                    Approve &amp; Write
+                  </button>
+                  <button className="btn" onClick={() => dismiss(p.id)}>Dismiss</button>
+                </div>
+              </>
+            )}
+            {p.state === 'written' && (
+              p.feedback ? (
+                <div className="muted" style={{ fontSize: '0.74rem', marginTop: 10 }}>
+                  Your verdict: <strong>{p.feedback.replace('_', ' ')}</strong> — thanks, logged for next time.
+                </div>
+              ) : (
+                <div style={{ marginTop: 10 }}>
+                  <div className="muted" style={{ fontSize: '0.74rem', marginBottom: 6 }}>
+                    How did it fly?
+                  </div>
+                  <div className="row">
+                    {FEEDBACK.map(([value, label]) => (
+                      <button key={value} className="btn" style={{ flex: 1 }}
+                              onClick={() => giveFeedback(p.id, value)}>
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )
             )}
           </div>
         ))}

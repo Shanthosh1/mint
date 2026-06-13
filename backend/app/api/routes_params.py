@@ -41,6 +41,11 @@ class TuningWindowRequest(BaseModel):
     axis: str = Field(..., pattern="^(roll|pitch|yaw)$")
 
 
+class FeedbackRequest(BaseModel):
+    outcome: str = Field(..., pattern="^(better|worse|no_change)$",
+                         examples=["better"])
+
+
 @router.get("/safety-registry")
 def safety_registry() -> dict:
     """Expose the (read-only) bounds so the UI can render limit hints."""
@@ -86,6 +91,23 @@ async def approve_proposal(proposal_id: str) -> dict:
         raise HTTPException(503, str(exc))
     return {"id": prop.id, "state": prop.state, "written_value": prop.proposed_value,
             "safety_note": prop.safety_note}
+
+
+@router.post("/proposals/{proposal_id}/feedback")
+def proposal_feedback(proposal_id: str, req: FeedbackRequest) -> dict:
+    """Record the pilot's verdict on a written change (better/worse/no_change).
+
+    Persists to the tuning memory so future proposals for the same airframe/
+    param/direction can show the track record. Advisory only — never alters
+    the safety bounds or auto-applies anything.
+    """
+    try:
+        prop = ADVISOR.record_feedback(proposal_id, req.outcome)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc))
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
+    return {"id": prop.id, "feedback": prop.feedback}
 
 
 @router.delete("/proposals/{proposal_id}")

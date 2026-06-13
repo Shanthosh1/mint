@@ -26,6 +26,7 @@ from typing import Optional
 from ..core.safety_registry import REGISTRY, Verdict
 from ..mavlink.connection import CONNECTION
 from ..mavlink.telemetry_hub import HUB
+from .tuning_memory import MEMORY, classify_direction
 
 
 class ProposalState(str, Enum):
@@ -48,6 +49,11 @@ class Proposal:
     state: ProposalState
     safety_note: str
     created_at: float = field(default_factory=time.time)
+    # Prior pilot outcomes for this airframe/param/direction (advisory only,
+    # surfaced to the UI). None when there is no history to show.
+    tuning_history: Optional[dict] = None
+    # Pilot's verdict once this was written and flown: better/worse/no_change.
+    feedback: Optional[str] = None
 
 
 class ParamAdvisor:
@@ -71,12 +77,20 @@ class ParamAdvisor:
         check = REGISTRY.validate_proposal(
             airframe.airframe_class, param, current, target_value
         )
+        written_value = check.allowed if check.allowed is not None else current
+
+        # Surface the pilot's prior track record for this exact change so they
+        # can weigh it before approving (advisory only — never auto-applied).
+        summary = MEMORY.summarize(
+            airframe.airframe_class, param,
+            classify_direction(current, written_value),
+        )
 
         prop = Proposal(
             id=uuid.uuid4().hex[:12],
             param=param,
             current_value=round(current, 6),
-            proposed_value=check.allowed if check.allowed is not None else current,
+            proposed_value=written_value,
             requested_value=target_value,
             rationale=rationale,
             airframe_class=airframe.airframe_class,
@@ -84,6 +98,7 @@ class ParamAdvisor:
                    if check.verdict in (Verdict.REJECTED_UNKNOWN, Verdict.REJECTED_BOUNDS)
                    else ProposalState.PRESENTED),
             safety_note=check.reason,
+            tuning_history=summary.to_dict() if summary else None,
         )
         self._proposals[prop.id] = prop
         HUB.publish("proposal", asdict(prop))
@@ -133,6 +148,36 @@ class ParamAdvisor:
         except Exception as exc:
             prop.state = ProposalState.FAILED
             prop.safety_note = f"Write failed: {exc}"
+        HUB.publish("proposal", asdict(prop))
+        return prop
+
+    # ------------------------------------------------------------------ #
+    def record_feedback(self, proposal_id: str, outcome: str) -> Proposal:
+        """Pilot's verdict on a written change (better/worse/no_change).
+
+        Only WRITTEN proposals can take feedback — there is no outcome to
+        record for a change that was never applied. The outcome is persisted
+        to the tuning memory keyed by airframe/param/direction so future
+        proposals for the same change can show the track record.
+        """
+        prop = self._proposals.get(proposal_id)
+        if prop is None:
+            raise KeyError(f"Unknown proposal {proposal_id}")
+        if prop.state != ProposalState.WRITTEN:
+            raise ValueError(
+                f"Proposal {proposal_id} is {prop.state}; feedback is only "
+                f"valid once a change has been written."
+            )
+        MEMORY.record_outcome(
+            proposal_id=prop.id,
+            param=prop.param,
+            airframe_class=prop.airframe_class,
+            direction=classify_direction(prop.current_value, prop.proposed_value),
+            current_value=prop.current_value,
+            written_value=prop.proposed_value,
+            outcome=outcome,
+        )
+        prop.feedback = outcome
         HUB.publish("proposal", asdict(prop))
         return prop
 

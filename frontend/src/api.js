@@ -32,6 +32,11 @@ export const api = {
     request(`/api/params/proposals/${id}/approve`, { method: 'POST' }),
   dismissProposal: (id) =>
     request(`/api/params/proposals/${id}`, { method: 'DELETE' }),
+  /** outcome: 'better' | 'worse' | 'no_change' */
+  proposalFeedback: (id, outcome) =>
+    request(`/api/params/proposals/${id}/feedback`, {
+      method: 'POST', body: JSON.stringify({ outcome }),
+    }),
   /** body: { param, rationale, and exactly one of target_value | scale_factor | delta } */
   createProposal: (body) =>
     request('/api/params/proposals', {

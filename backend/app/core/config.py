@@ -87,3 +87,13 @@ ULOG_UPLOAD_CHUNK = 1024 * 1024            # 1 MiB chunks while spooling to disk
 # default protects 8 GiB field laptops; raise MINT_ULOG_MAX_MIB on a workstation.
 ULOG_MAX_BYTES = int(_env("ULOG_MAX_MIB", "800")) * 1024 * 1024
 ULOG_TMP_DIR = Path(_env("ULOG_TMP_DIR", str(Path.home() / ".mint" / "uploads")))
+
+# ---------------------------------------------------------------------------
+# Tuning feedback memory
+# ---------------------------------------------------------------------------
+# Append-only log of pilot "better/worse/no-change" outcomes for written
+# parameter changes. Surfaced (read-only) as prior context when a new
+# proposal is staged for the same airframe class + param + direction.
+TUNING_HISTORY_PATH = Path(
+    _env("TUNING_HISTORY_PATH", str(Path.home() / ".mint" / "tuning_history.jsonl"))
+)
