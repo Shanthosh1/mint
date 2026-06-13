@@ -1,6 +1,6 @@
 # MINT: MAVLink Intelligent Tuning Assistant
 
-MINT is a desktop companion tool for drone and aircraft pilots running the PX4 autopilot. It runs locally on your ground station laptop alongside QGroundControl to help you safely tune control loops and analyze flight logs in the field.
+MINT is a desktop companion tool for pilots running the PX4 autopilot. It runs locally on your ground station laptop alongside QGroundControl to help you safely tune control loops and analyze flight logs in the field.
 
 To make things easy, MINT runs a small telemetry proxy (`mavp2p`) in the background. You plug in your vehicle's telemetry link, and MINT splits it into separate streams for your Ground Control Station (GCS) and its own real-time analysis engines—meaning you don't have to fiddle with serial ports or lose your telemetry connection.
 
@@ -18,7 +18,7 @@ To make things easy, MINT runs a small telemetry proxy (`mavp2p`) in the backgro
 
 ---
 
-## 🌟 Core Features
+## Core Features
 
 * **Real-Time PID Rate Tuning**: Monitors live pilot inputs vs. the vehicle's actual response. MINT measures response speed (time constant $\tau$), tracking quality (correlation $r$), and overshoot to suggest concrete gain changes.
 * **Offline ULog Analysis**: Upload your flight logs (even large files) to get a full post-flight report. It runs FFTs on your gyro data to identify vibration spikes and recommend exact notch/cutoff filter frequencies.
@@ -118,12 +118,12 @@ We also have a GitHub Actions workflow configured in [.github/workflows/build.ym
 
 ---
 
-## 🤖 AI Credits & Disclaimer
+## AI Credits & Disclaimer
 
 This application was developed with the assistance of agentic AI coding tools. Agentic AI was utilized to design and build the entire React frontend, and to optimize the Python backend codebase, taking it from an initial proof-of-concept (POC) state into a robust, deployment-ready application.
 
 ---
 
-## 📄 License
+## License
 
 MINT is open-source software released under the [MIT License](LICENSE).

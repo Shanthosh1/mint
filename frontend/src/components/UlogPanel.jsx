@@ -13,6 +13,7 @@ export default function UlogPanel() {
   const [busy, setBusy] = useState(false);
   const [report, setReport] = useState(null);
   const [error, setError] = useState(null);
+  const [activeTab, setActiveTab] = useState('pid');
 
   const analyze = async (file) => {
     if (!file) return;
@@ -68,133 +69,266 @@ export default function UlogPanel() {
 
       {report && (
         <div className="stack" style={{ marginTop: 14 }}>
-          <div className="muted mono">
-            {report.original_filename} · {report.duration_s}s flight ·
-            {' '}{(report.size_bytes / 2 ** 20).toFixed(1)} MiB · PX4 {report.px4_version}
-            {report.airframe_label && <> · {report.airframe_label}</>}
+          <div className="muted mono" style={{ fontSize: '0.78rem', background: 'rgba(0,0,0,0.15)', padding: '8px 12px', borderRadius: 8, border: '1px solid var(--glass-border)' }}>
+            📄 {report.original_filename} &nbsp;·&nbsp; ⏱️ {report.duration_s}s flight &nbsp;·&nbsp;
+            💾 {(report.size_bytes / 2 ** 20).toFixed(1)} MiB &nbsp;·&nbsp; ⚙️ PX4 {report.px4_version}
+            {report.airframe_label && <>&nbsp;·&nbsp; 🚀 {report.airframe_label}</>}
           </div>
 
-          <section>
-            <h2>PID Rate Tracking</h2>
-            {sections.pid.skipped
-              ? <div className="muted">{sections.pid.skipped}</div>
-              : <>
-                  {Object.entries(sections.pid.axes ?? {}).flatMap(([ax, s]) => {
-                    if (s && (s.mc || s.fw)) {
-                      return [
-                        { label: `${ax} (MC)`, data: s.mc },
-                        { label: `${ax} (FW)`, data: s.fw }
-                      ];
-                    }
-                    return [{ label: ax, data: s }];
-                  }).map(({ label, data }) => (
-                    <div key={label} className="muted mono">
-                      {label}: {(!data || data.n_steps === 0)
-                        ? 'no step maneuvers found'
-                        : <>
-                            {data.n_steps} steps · τ {data.tau_s_median ?? '—'}s ·
-                            settle {data.settling_s_median ?? '—'}s ·{' '}
-                            <span style={{ color: data.overshoot_max > 0.25 ? 'var(--warn)' : undefined }}>
-                              overshoot {data.overshoot_max !== undefined ? (data.overshoot_max * 100).toFixed(0) : '—'}%
-                            </span>{' · '}
-                            <span style={{ color: data.r !== null && data.r < 0.85 ? 'var(--crit)' : undefined }}>
-                              r {data.r ?? '—'}
-                            </span> · ε {data.nrmse ?? '—'}
-                          </>}
-                    </div>
-                  ))}
-                  {sections.pid.notes?.map((n, i) => (
-                    <div key={i} className="muted" style={{ marginTop: 4 }}>ℹ {n}</div>
-                  ))}
-                  {sections.pid.recommendations?.map((r) => recBlock(r))}
-                  </>}
-          </section>
+          <div className="tabs-container" style={{ marginTop: 6 }}>
+            <button className={`tab-btn ${activeTab === 'pid' ? 'active' : ''}`} onClick={() => setActiveTab('pid')}>
+              🎯 PID Tuning
+            </button>
+            <button className={`tab-btn ${activeTab === 'vibration' ? 'active' : ''}`} onClick={() => setActiveTab('vibration')}>
+              📶 Vibrations &amp; Filters
+            </button>
+            <button className={`tab-btn ${activeTab === 'actuator' ? 'active' : ''}`} onClick={() => setActiveTab('actuator')}>
+              ⚡ Actuators
+            </button>
+            <button className={`tab-btn ${activeTab === 'ekf' ? 'active' : ''}`} onClick={() => setActiveTab('ekf')}>
+              🧠 EKF Health
+            </button>
+          </div>
 
-          <section>
-            <h2>Vibration / FFT</h2>
-            {sections.vibration.skipped
-              ? <div className="muted">{sections.vibration.skipped}</div>
-              : <>
-                  {Object.entries(sections.vibration.axes).map(([ax, a]) => (
-                    <div key={ax} className="muted">
-                      gyro {ax}: {a.peaks.length
-                        ? a.peaks.map((p) => `${p.freq_hz} Hz`).join(', ')
-                        : 'no significant peaks'}
-                    </div>
-                  ))}
-                  {recBlock(sections.vibration.recommendation)}
-                </>}
-          </section>
+          {/* --- Tab Content: PID Loops --- */}
+          {activeTab === 'pid' && (
+            <div className="stack animate-fade">
+              {sections.pid.skipped ? (
+                <div className="muted">{sections.pid.skipped}</div>
+              ) : (
+                <>
+                  <table className="modern-table">
+                    <thead>
+                      <tr>
+                        <th>Axis / Mode</th>
+                        <th>Steps</th>
+                        <th>τ (Response)</th>
+                        <th>Settling</th>
+                        <th>Overshoot</th>
+                        <th>Tracking (r)</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {Object.entries(sections.pid.axes ?? {}).flatMap(([ax, s]) => {
+                        if (s && (s.mc || s.fw)) {
+                          return [
+                            { label: `${ax} (MC)`, data: s.mc },
+                            { label: `${ax} (FW)`, data: s.fw }
+                          ];
+                        }
+                        return [{ label: ax, data: s }];
+                      }).map(({ label, data }) => (
+                        <tr key={label}>
+                          <td className="mono" style={{ fontWeight: 600 }}>{label}</td>
+                          {(!data || data.n_steps === 0) ? (
+                            <td colSpan={5} className="muted" style={{ textAlign: 'center', fontSize: '0.8rem' }}>no step maneuvers found</td>
+                          ) : (
+                            <>
+                              <td>{data.n_steps}</td>
+                              <td className="mono">{data.tau_s_median !== undefined && data.tau_s_median !== null ? `${data.tau_s_median}s` : '—'}</td>
+                              <td className="mono">{data.settling_s_median !== undefined && data.settling_s_median !== null ? `${data.settling_s_median}s` : '—'}</td>
+                              <td>
+                                <span className={`pill ${data.overshoot_max > 0.25 ? 'warn' : 'ok'}`}>
+                                  {data.overshoot_max !== undefined && data.overshoot_max !== null ? `${(data.overshoot_max * 100).toFixed(0)}%` : '—'}
+                                </span>
+                              </td>
+                              <td>
+                                <span className={`pill ${data.r !== null && data.r < 0.85 ? 'crit' : 'ok'}`}>
+                                  {data.r !== undefined && data.r !== null ? data.r : '—'}
+                                </span>
+                              </td>
+                            </>
+                          )}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
 
-          <section>
-            <h2>Filter Tuning</h2>
-            {sections.filters.skipped
-              ? <div className="muted">{sections.filters.skipped}</div>
-              : <>
-                  <div className="muted mono">
-                    spectrum: {sections.filters.spectrum_class} · gyro HF noise{' '}
-                    {sections.filters.gyro_hf_rms_rad_s ?? '—'} rad/s ·
-                    filter lag {sections.filters.filter_delay_ms ?? '—'} ms ·
-                    notch scheme {sections.filters.notch_naming}
-                    {sections.filters.harmonics_of_hz &&
-                      <> · harmonics of {sections.filters.harmonics_of_hz} Hz</>}
+                  <div className="stack" style={{ marginTop: 14, gap: 8 }}>
+                    {sections.pid.notes?.map((n, i) => {
+                      let severity = 'info';
+                      if (n.includes('Check the actuator-saturation') || n.includes('no usable step')) {
+                        severity = 'warning';
+                      }
+                      return (
+                        <div key={i} className={`insight-item ${severity}`}>
+                          <span className="insight-icon">{severity === 'warning' ? '⚠' : 'ℹ'}</span>
+                          <div className="insight-content">{n}</div>
+                        </div>
+                      );
+                    })}
                   </div>
-                  {sections.filters.notes?.map((n, i) => (
-                    <div key={i} className="muted" style={{ marginTop: 4 }}>ℹ {n}</div>
-                  ))}
-                  {sections.filters.recommendations?.map((r) => recBlock(r))}
-                </>}
-          </section>
 
-          <section>
-            <h2>Actuator Saturation</h2>
-            {sections.actuator_saturation.skipped
-              ? <div className="muted">{sections.actuator_saturation.skipped}</div>
-              : <>
-                  {Object.entries(sections.actuator_saturation.channels).map(([ch, c]) => (
-                    <div key={ch} className="muted" style={{ color: c.flagged ? 'var(--warn)' : undefined }}>
-                      {ch}: {c.saturated_pct}% saturated, longest burst {c.longest_burst_s}s
-                      {c.flagged && ' ⚠'}
-                    </div>
-                  ))}
-                  {sections.actuator_saturation.advice && (
-                    <div className="alert warning" style={{ marginTop: 8 }}>
-                      {sections.actuator_saturation.advice}
+                  {sections.pid.recommendations?.length > 0 && (
+                    <div style={{ marginTop: 14 }}>
+                      <h3 style={{ margin: '0 0 8px 0', fontSize: '0.78rem', color: 'var(--text-mid)', letterSpacing: '0.05em', textTransform: 'uppercase' }}>
+                        Proposed Gain Adjustments
+                      </h3>
+                      {sections.pid.recommendations.map((r, i) => (
+                        <div key={i} style={{ marginBottom: 8 }}>{recBlock(r)}</div>
+                      ))}
                     </div>
                   )}
-                </>}
-          </section>
+                </>
+              )}
+            </div>
+          )}
 
-          <section>
-            <h2>EKF Timing &amp; Noise</h2>
-            {sections.ekf_delays.skipped
-              ? <div className="muted">{sections.ekf_delays.skipped}</div>
-              : <>
-                  <div className="muted">
-                    Measured GPS delay: {sections.ekf_delays.measured_gps_delay_ms} ms
-                    (configured {sections.ekf_delays.current_EKF2_GPS_DELAY} ms)
+          {/* --- Tab Content: Vibrations & Filters --- */}
+          {activeTab === 'vibration' && (
+            <div className="stack animate-fade">
+              {sections.vibration.skipped ? (
+                <div className="muted">{sections.vibration.skipped}</div>
+              ) : (
+                <>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 12 }}>
+                    {Object.entries(sections.vibration.axes).map(([ax, a]) => (
+                      <div key={ax} className="proposal" style={{ padding: '12px 14px' }}>
+                        <div style={{ fontSize: '0.7rem', textTransform: 'uppercase', color: 'var(--text-mid)', fontWeight: 600, letterSpacing: '0.05em', marginBottom: 4 }}>
+                          Gyro {ax} Peak Noise
+                        </div>
+                        <div className="mono" style={{ fontSize: '0.95rem', fontWeight: 700, color: a.peaks.length ? 'var(--warn)' : 'var(--ok)' }}>
+                          {a.peaks.length ? a.peaks.map((p) => `${p.freq_hz} Hz`).join(', ') : 'No significant peaks'}
+                        </div>
+                      </div>
+                    ))}
                   </div>
-                  {recBlock(sections.ekf_delays.recommendation)}
-                </>}
-            {sections.ekf_delays.baro && (sections.ekf_delays.baro.skipped
-              ? <div className="muted">baro: {sections.ekf_delays.baro.skipped}</div>
-              : <>
-                  <div className="muted">
-                    Measured baro delay: {sections.ekf_delays.baro.measured_baro_delay_ms} ms
-                    (configured {sections.ekf_delays.baro.current_EKF2_BARO_DELAY} ms)
+
+                  {!sections.filters.skipped && (
+                    <div className="proposal" style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 12, marginTop: 4 }}>
+                      <div>
+                        <span className="muted" style={{ fontSize: '0.7rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Spectrum Class</span>
+                        <div className="mono" style={{ fontSize: '0.85rem', fontWeight: 600, marginTop: 2 }}>{sections.filters.spectrum_class}</div>
+                      </div>
+                      <div>
+                        <span className="muted" style={{ fontSize: '0.7rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Gyro HF Noise</span>
+                        <div className="mono" style={{ fontSize: '0.85rem', fontWeight: 600, marginTop: 2, color: sections.filters.gyro_hf_rms_rad_s > 0.05 ? 'var(--warn)' : 'var(--ok)' }}>
+                          {sections.filters.gyro_hf_rms_rad_s ?? '—'} rad/s
+                        </div>
+                      </div>
+                      <div>
+                        <span className="muted" style={{ fontSize: '0.7rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Filter Phase Lag</span>
+                        <div className="mono" style={{ fontSize: '0.85rem', fontWeight: 600, marginTop: 2 }}>{sections.filters.filter_delay_ms ?? '—'} ms</div>
+                      </div>
+                      <div>
+                        <span className="muted" style={{ fontSize: '0.7rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Notch Scheme</span>
+                        <div className="mono" style={{ fontSize: '0.85rem', fontWeight: 600, marginTop: 2 }}>{sections.filters.notch_naming}</div>
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="stack" style={{ gap: 8 }}>
+                    {sections.filters.notes?.map((n, i) => (
+                      <div key={i} className="insight-item info">
+                        <span className="insight-icon">ℹ</span>
+                        <div className="insight-content">{n}</div>
+                      </div>
+                    ))}
                   </div>
-                  {recBlock(sections.ekf_delays.baro.recommendation)}
-                </>)}
-            {sections.ekf_noise.skipped
-              ? <div className="muted">{sections.ekf_noise.skipped}</div>
-              : <>
-                  <div className="muted">
-                    Hover floor — accel {sections.ekf_noise.accel_std_m_s2} m/s²,
-                    gyro {sections.ekf_noise.gyro_std_rad_s} rad/s
+
+                  {(sections.vibration.recommendation || (sections.filters.recommendations && sections.filters.recommendations.length > 0)) && (
+                    <div style={{ marginTop: 8 }}>
+                      <h3 style={{ margin: '0 0 8px 0', fontSize: '0.78rem', color: 'var(--text-mid)', letterSpacing: '0.05em', textTransform: 'uppercase' }}>
+                        Proposed Filter Changes
+                      </h3>
+                      {recBlock(sections.vibration.recommendation)}
+                      {sections.filters.recommendations?.map((r, i) => (
+                        <div key={i} style={{ marginTop: 8 }}>{recBlock(r)}</div>
+                      ))}
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+
+          {/* --- Tab Content: Actuator Saturation --- */}
+          {activeTab === 'actuator' && (
+            <div className="stack animate-fade">
+              {sections.actuator_saturation.skipped ? (
+                <div className="muted">{sections.actuator_saturation.skipped}</div>
+              ) : (
+                <>
+                  <div className="stack" style={{ gap: 12 }}>
+                    {Object.entries(sections.actuator_saturation.channels).map(([ch, c]) => (
+                      <div key={ch} className="gauge">
+                        <div className="spread row" style={{ fontSize: '0.8rem', marginBottom: 4 }}>
+                          <span className="mono" style={{ fontWeight: 600 }}>{ch}</span>
+                          <span className="mono" style={{ color: c.flagged ? 'var(--crit)' : 'var(--text-mid)' }}>
+                            {c.saturated_pct}% saturated {c.longest_burst_s > 0 && `(longest burst: ${c.longest_burst_s}s)`}
+                          </span>
+                        </div>
+                        <div className="gauge-track">
+                          <div className={`gauge-fill ${c.flagged ? 'crit' : c.saturated_pct > 5 ? 'warn' : 'ok'}`} style={{ width: `${Math.min(c.saturated_pct || 1, 100)}%` }}></div>
+                        </div>
+                      </div>
+                    ))}
                   </div>
-                  {sections.ekf_noise.recommendations?.map((r) => recBlock(r))}
-                </>}
-          </section>
+
+                  {sections.actuator_saturation.advice && (
+                    <div className="insight-item warning" style={{ marginTop: 8 }}>
+                      <span className="insight-icon">⚠</span>
+                      <div className="insight-content">{sections.actuator_saturation.advice}</div>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+
+          {/* --- Tab Content: EKF Health --- */}
+          {activeTab === 'ekf' && (
+            <div className="stack animate-fade">
+              <div className="stack" style={{ gap: 12 }}>
+                {sections.ekf_delays.skipped ? (
+                  <div className="muted">{sections.ekf_delays.skipped}</div>
+                ) : (
+                  <div className="proposal">
+                    <div style={{ fontSize: '0.7rem', textTransform: 'uppercase', color: 'var(--text-mid)', fontWeight: 600, letterSpacing: '0.05em', marginBottom: 6 }}>
+                      GPS Delay Diagnostic
+                    </div>
+                    <div style={{ fontSize: '0.88rem' }}>
+                      Measured Delay: <strong style={{ color: 'var(--accent)' }}>{sections.ekf_delays.measured_gps_delay_ms} ms</strong> &nbsp;·&nbsp; Currently Configured: <span className="mono">{sections.ekf_delays.current_EKF2_GPS_DELAY} ms</span>
+                    </div>
+                    {recBlock(sections.ekf_delays.recommendation)}
+                  </div>
+                )}
+
+                {sections.ekf_delays.baro && (
+                  sections.ekf_delays.baro.skipped ? (
+                    <div className="muted">Baro: {sections.ekf_delays.baro.skipped}</div>
+                  ) : (
+                    <div className="proposal">
+                      <div style={{ fontSize: '0.7rem', textTransform: 'uppercase', color: 'var(--text-mid)', fontWeight: 600, letterSpacing: '0.05em', marginBottom: 6 }}>
+                        Barometer Delay Diagnostic
+                      </div>
+                      <div style={{ fontSize: '0.88rem' }}>
+                        Measured Delay: <strong style={{ color: 'var(--accent)' }}>{sections.ekf_delays.baro.measured_baro_delay_ms} ms</strong> &nbsp;·&nbsp; Currently Configured: <span className="mono">{sections.ekf_delays.baro.current_EKF2_BARO_DELAY} ms</span>
+                      </div>
+                      {recBlock(sections.ekf_delays.baro.recommendation)}
+                    </div>
+                  )
+                )}
+
+                {sections.ekf_noise.skipped ? (
+                  <div className="muted">{sections.ekf_noise.skipped}</div>
+                ) : (
+                  <div className="proposal">
+                    <div style={{ fontSize: '0.7rem', textTransform: 'uppercase', color: 'var(--text-mid)', fontWeight: 600, letterSpacing: '0.05em', marginBottom: 6 }}>
+                      Hover Vibration Floor
+                    </div>
+                    <div style={{ fontSize: '0.88rem' }}>
+                      Accel Noise Floor: <strong style={{ color: sections.ekf_noise.accel_std_m_s2 > 1.5 ? 'var(--warn)' : 'var(--ok)' }}>{sections.ekf_noise.accel_std_m_s2} m/s²</strong> &nbsp;·&nbsp; Gyro Noise Floor: <span className="mono">{sections.ekf_noise.gyro_std_rad_s} rad/s</span>
+                    </div>
+                    {sections.ekf_noise.recommendations?.map((r, i) => (
+                      <div key={i} style={{ marginTop: 8 }}>{recBlock(r)}</div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
         </div>
       )}
     </div>
