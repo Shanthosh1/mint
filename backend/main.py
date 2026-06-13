@@ -105,6 +105,16 @@ app = create_app()
 
 if __name__ == "__main__":
     import os
+    import threading
+    import time
+
     if not os.environ.get("MINT_NO_BROWSER"):
-        webbrowser.open(f"http://{config.HTTP_HOST}:{config.HTTP_PORT}")
+        def open_browser():
+            time.sleep(0.5)
+            try:
+                webbrowser.open(f"http://{config.HTTP_HOST}:{config.HTTP_PORT}")
+            except Exception as e:
+                log.warning("Failed to open browser automatically: %s", e)
+        threading.Thread(target=open_browser, daemon=True).start()
+
     uvicorn.run(app, host=config.HTTP_HOST, port=config.HTTP_PORT, log_level="info")

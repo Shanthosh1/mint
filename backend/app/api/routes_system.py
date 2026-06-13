@@ -10,7 +10,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, model_validator
 
 from ..core import config, platform_utils
-from ..mavlink.connection import CONNECTION
+from ..mavlink.connection import CONNECTION, UnsupportedVehicleError
 from ..mavlink.router_manager import ROUTER, ConnectionTarget
 
 log = logging.getLogger("mint.api.system")
@@ -92,9 +92,14 @@ async def vehicle_connect() -> dict:
     """Begin the MAVSDK handshake against the routed endpoint."""
     if not ROUTER.is_running:
         raise HTTPException(409, "Start the telemetry router first")
-    state = await CONNECTION.connect()
+    try:
+        state = await CONNECTION.connect()
+    except UnsupportedVehicleError as exc:
+        # Non-PX4 stack, pre-1.14 firmware, or out-of-scope airframe.
+        raise HTTPException(422, str(exc))
     return {
         "connected": state.connected,
+        "fw_version": state.fw_version,
         "airframe": (
             {
                 "sys_autostart": state.airframe.sys_autostart,

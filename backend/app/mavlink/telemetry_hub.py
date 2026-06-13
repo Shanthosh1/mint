@@ -36,11 +36,16 @@ class TelemetryHub:
         self._subscribers: dict[int, asyncio.Queue[Event]] = {}
         self._next_id = 0
         self._channel_counts: dict[str, int] = defaultdict(int)
+        # Monotonic timestamp of the last publish per channel — drives
+        # staleness detection so consumers can tell "no fault" apart from
+        # "the data stopped arriving" (dead router, FC stopped streaming).
+        self._last_seen: dict[str, float] = {}
 
     def publish(self, channel: str, payload: dict[str, Any]) -> None:
         """Non-blocking publish; never raises on full queues."""
         event = Event(channel=channel, payload=payload)
         self._channel_counts[channel] += 1
+        self._last_seen[channel] = event.ts
         for q in self._subscribers.values():
             if q.full():
                 try:
@@ -60,6 +65,20 @@ class TelemetryHub:
                 yield await q.get()
         finally:
             self._subscribers.pop(sub_id, None)
+
+    def is_stale(self, channel: str, max_age_s: float = 2.0) -> bool:
+        """True if `channel` has never been seen or is older than `max_age_s`.
+
+        Uses the same monotonic clock as Event.ts. Engines gate analysis on
+        this so a dead firehose surfaces as an explicit staleness signal
+        instead of frozen metrics the pilot might trust.
+        """
+        last = self._last_seen.get(channel)
+        return last is None or (time.monotonic() - last) > max_age_s
+
+    def last_seen(self, channel: str) -> float | None:
+        """Monotonic timestamp of the last publish on `channel`, or None."""
+        return self._last_seen.get(channel)
 
     def stats(self) -> dict:
         return {

@@ -18,12 +18,38 @@ from pathlib import Path
 import pandas as pd
 from pyulog import ULog
 
+import re
+
 from ..core import config
-from ..mavlink.airframe import classify_airframe
+from ..mavlink.airframe import UnsupportedAirframeError, classify_airframe
 from . import (actuator_saturation, ekf_offline, filter_advisor,
                pid_offline, vibration_fft)
 
 log = logging.getLogger("mint.ulog")
+
+
+class UnsupportedLogError(Exception):
+    """Raised when a ULog is not from a supported PX4 target.
+
+    Covers a non-PX4 log, a PX4 firmware older than the supported floor,
+    or an out-of-scope airframe (rover/boat/sub/balloon)."""
+
+
+def _parse_px4_version(ver_sw: str | None) -> tuple[int, int, int] | None:
+    """Pull (major, minor, patch) out of a ULog ver_sw string.
+
+    PX4 stores values like "v1.14.0", "1.14.0-rc1", or "1.14"; return None when no
+    dotted version can be found.
+    """
+    if not ver_sw:
+        return None
+    m = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", str(ver_sw))
+    if not m:
+        return None
+    major = int(m.group(1))
+    minor = int(m.group(2))
+    patch = int(m.group(3)) if m.group(3) else 0
+    return major, minor, patch
 
 # Only these datasets are ever materialized into memory.
 _DATASETS = [
@@ -37,6 +63,7 @@ _DATASETS = [
     "vehicle_angular_velocity",   # filtered body rates (PID analysis)
     "vehicle_rates_setpoint",     # commanded body rates (PID analysis)
     "vehicle_air_data",           # baro altitude (EKF2_BARO_DELAY)
+    "vehicle_status",
 ]
 
 
@@ -96,18 +123,49 @@ def analyze(path: Path) -> dict:
     log.info("Parsing ULog: %s", path)
     ulog = ULog(str(path), message_name_filter_list=_DATASETS)
 
+    # --- Supported-target gate (PX4 only, >= MIN_PX4_VERSION, MR/FW/VTOL) ---
+    sys_name = str(ulog.msg_info_dict.get("sys_name", "")).strip()
+    if sys_name and sys_name.upper() != "PX4":
+        raise UnsupportedLogError(
+            f"Log was produced by '{sys_name}', not PX4. MINT supports PX4 only."
+        )
+    
+    ver_sw = ulog.msg_info_dict.get("ver_sw")
+    if ver_sw:
+        ver = _parse_px4_version(ver_sw)
+        if ver is not None:
+            if ver[:2] < config.MIN_PX4_VERSION:
+                floor = config.MIN_PX4_VERSION
+                raise UnsupportedLogError(
+                    f"Log is from PX4 v{ver[0]}.{ver[1]}.{ver[2]}, older than the "
+                    f"supported minimum v{floor[0]}.{floor[1]}."
+                )
+        else:
+            log.warning("Could not parse PX4 firmware version string '%s' — proceeding with analysis.", ver_sw)
+    else:
+        log.warning("PX4 firmware version (ver_sw) is missing from log metadata — proceeding with caution.")
+
     # Airframe class from the log itself — drives which gain parameters
-    # the PID advisor targets, independent of any live connection.
+    # the PID advisor targets, independent of any live connection. An
+    # out-of-scope airframe (rover/boat/sub/balloon) is rejected outright.
     sys_autostart = ulog.initial_parameters.get("SYS_AUTOSTART")
-    airframe = classify_airframe(int(sys_autostart)) if sys_autostart else None
+    if not sys_autostart:
+        raise UnsupportedLogError(
+            "Log has no SYS_AUTOSTART parameter — cannot establish a "
+            "supported airframe class."
+        )
+    try:
+        airframe = classify_airframe(int(sys_autostart))
+    except UnsupportedAirframeError as exc:
+        raise UnsupportedLogError(str(exc)) from exc
 
     report: dict = {
         "file": path.name,
         "duration_s": round((ulog.last_timestamp - ulog.start_timestamp) / 1e6, 1),
         "px4_version": ulog.msg_info_dict.get("ver_sw", "unknown"),
         "sys_autostart": sys_autostart,
-        "airframe_class": airframe.airframe_class if airframe else None,
-        "airframe_label": airframe.label if airframe else None,
+        "airframe_class": airframe.airframe_class,
+        "airframe_label": airframe.label,
         "initial_params": {
             k: v for k, v in ulog.initial_parameters.items()
             if k.startswith(("MC_", "FW_", "IMU_", "EKF2_"))
@@ -123,12 +181,14 @@ def analyze(path: Path) -> dict:
     rates_sp = dataset_frame(ulog, "vehicle_rates_setpoint")
     ang_vel = dataset_frame(ulog, "vehicle_angular_velocity")
     air_data = dataset_frame(ulog, "vehicle_air_data")
+    status = dataset_frame(ulog, "vehicle_status")
 
     sections = report["sections"]
     sections["pid"] = pid_offline.analyze_pid(
         rates_sp=rates_sp, ang_vel=ang_vel, sensor=sensor,
         params=report["initial_params"],
         airframe_class=report["airframe_class"],
+        status=status,
     )
     sections["vibration"] = (
         vibration_fft.analyze_vibration(sensor)

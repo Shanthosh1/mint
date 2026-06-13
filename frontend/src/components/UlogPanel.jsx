@@ -79,19 +79,27 @@ export default function UlogPanel() {
             {sections.pid.skipped
               ? <div className="muted">{sections.pid.skipped}</div>
               : <>
-                  {Object.entries(sections.pid.axes ?? {}).map(([ax, s]) => (
-                    <div key={ax} className="muted mono">
-                      {ax}: {s.n_steps === 0
+                  {Object.entries(sections.pid.axes ?? {}).flatMap(([ax, s]) => {
+                    if (s && (s.mc || s.fw)) {
+                      return [
+                        { label: `${ax} (MC)`, data: s.mc },
+                        { label: `${ax} (FW)`, data: s.fw }
+                      ];
+                    }
+                    return [{ label: ax, data: s }];
+                  }).map(({ label, data }) => (
+                    <div key={label} className="muted mono">
+                      {label}: {(!data || data.n_steps === 0)
                         ? 'no step maneuvers found'
                         : <>
-                            {s.n_steps} steps · τ {s.tau_s_median ?? '—'}s ·
-                            settle {s.settling_s_median ?? '—'}s ·{' '}
-                            <span style={{ color: s.overshoot_max > 0.25 ? 'var(--warn)' : undefined }}>
-                              overshoot {(s.overshoot_max * 100).toFixed(0)}%
+                            {data.n_steps} steps · τ {data.tau_s_median ?? '—'}s ·
+                            settle {data.settling_s_median ?? '—'}s ·{' '}
+                            <span style={{ color: data.overshoot_max > 0.25 ? 'var(--warn)' : undefined }}>
+                              overshoot {data.overshoot_max !== undefined ? (data.overshoot_max * 100).toFixed(0) : '—'}%
                             </span>{' · '}
-                            <span style={{ color: s.r !== null && s.r < 0.85 ? 'var(--crit)' : undefined }}>
-                              r {s.r ?? '—'}
-                            </span> · ε {s.nrmse ?? '—'}
+                            <span style={{ color: data.r !== null && data.r < 0.85 ? 'var(--crit)' : undefined }}>
+                              r {data.r ?? '—'}
+                            </span> · ε {data.nrmse ?? '—'}
                           </>}
                     </div>
                   ))}
@@ -99,7 +107,7 @@ export default function UlogPanel() {
                     <div key={i} className="muted" style={{ marginTop: 4 }}>ℹ {n}</div>
                   ))}
                   {sections.pid.recommendations?.map((r) => recBlock(r))}
-                </>}
+                  </>}
           </section>
 
           <section>

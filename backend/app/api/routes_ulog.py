@@ -13,7 +13,7 @@ import logging
 from fastapi import APIRouter, HTTPException, UploadFile
 
 from ..analysis import ulog_pipeline
-from ..analysis.ulog_pipeline import UlogTooLargeError
+from ..analysis.ulog_pipeline import UlogTooLargeError, UnsupportedLogError
 
 log = logging.getLogger("mint.api.ulog")
 router = APIRouter(prefix="/api", tags=["ulog"])
@@ -38,6 +38,8 @@ async def analyze_ulog(file: UploadFile) -> dict:
         return report
     except UlogTooLargeError as exc:
         raise HTTPException(413, str(exc))
+    except UnsupportedLogError as exc:
+        raise HTTPException(422, str(exc))
     except Exception as exc:
         log.exception("ULog analysis failed")
         raise HTTPException(422, f"Could not analyze log: {exc}")

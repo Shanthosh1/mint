@@ -1,0 +1,73 @@
+{
+  "_comment": [
+    "PX4 airframe identification tables for MINT. Edit this file to add or",
+    "re-map airframes without touching code — airframe.py loads it at import.",
+    "",
+    "Source of truth: PX4-Autopilot ROMFS/px4fmu_common/init.d/airframes/",
+    "CMakeLists.txt (the px4_add_romfs_files groups). Keep ranges aligned with",
+    "that file when bumping the supported PX4 version.",
+    "",
+    "MINT supports multirotor (MULTIROTOR), fixed-wing (FIXED_WING), flying-",
+    "wing/delta (DELTA_WING) and VTOL airframes only. Any SYS_AUTOSTART that",
+    "matches no entry here is REJECTED (UnsupportedAirframeError) rather than",
+    "coerced into a default class — coercing an out-of-scope vehicle (rover,",
+    "boat, submarine, balloon, airship, helicopter, autogyro, spacecraft)",
+    "would hand it advice from a control cascade it does not run.",
+    "",
+    "Deliberately absent (-> rejected): 2507 airship, 16000-17999 heli/",
+    "autogyro, 18000-18999 balloon, 50000-52999 rover, 60000-61000 underwater,",
+    "70000+ spacecraft, and the 1104 Ackermann rover sim."
+  ],
+
+  "supported_classes": ["MULTIROTOR", "FIXED_WING", "DELTA_WING", "VTOL"],
+
+  "sim_ids": {
+    "1001": {"class": "MULTIROTOR", "label": "Quadrotor X (HIL sim)"},
+    "1002": {"class": "VTOL", "label": "Standard VTOL (HIL sim)"},
+    "1100": {"class": "MULTIROTOR", "label": "Quadrotor X (SIH sim)"},
+    "1101": {"class": "FIXED_WING", "label": "Fixed-Wing (SIH sim)"},
+    "1102": {"class": "VTOL", "label": "VTOL Tailsitter Duo (SIH sim)"},
+    "1103": {"class": "VTOL", "label": "Standard VTOL (SIH sim)"},
+    "1105": {"class": "MULTIROTOR", "label": "Hexarotor X (SIH sim)"}
+  },
+
+  "ranges": [
+    {"start": 2000, "end": 2506, "class": "FIXED_WING", "label": "Fixed-Wing (standard plane)"},
+    {"start": 2508, "end": 2999, "class": "FIXED_WING", "label": "Fixed-Wing (standard plane)"},
+    {"start": 3000, "end": 3999, "class": "DELTA_WING", "label": "Flying Wing / Delta"},
+    {"start": 4000, "end": 4999, "class": "MULTIROTOR", "label": "Quadrotor X"},
+    {"start": 5000, "end": 5999, "class": "MULTIROTOR", "label": "Quadrotor +"},
+    {"start": 6000, "end": 6999, "class": "MULTIROTOR", "label": "Hexarotor X"},
+    {"start": 7000, "end": 7999, "class": "MULTIROTOR", "label": "Hexarotor +"},
+    {"start": 8000, "end": 8999, "class": "MULTIROTOR", "label": "Octorotor X"},
+    {"start": 9000, "end": 9999, "class": "MULTIROTOR", "label": "Octorotor +"},
+    {"start": 11000, "end": 11999, "class": "MULTIROTOR", "label": "Hexa Coax"},
+    {"start": 12000, "end": 12999, "class": "MULTIROTOR", "label": "Octo Coax"},
+    {"start": 13000, "end": 13999, "class": "VTOL", "label": "VTOL (standard/tiltrotor/tailsitter)"},
+    {"start": 14000, "end": 14999, "class": "MULTIROTOR", "label": "Multicopter with tilt"},
+    {"start": 24000, "end": 24999, "class": "MULTIROTOR", "label": "Dodecarotor Coax"}
+  ],
+
+  "mav_type_class": {
+    "1": {"class": "FIXED_WING", "label": "Fixed-Wing"},
+    "2": {"class": "MULTIROTOR", "label": "Quadrotor"},
+    "13": {"class": "MULTIROTOR", "label": "Hexarotor"},
+    "14": {"class": "MULTIROTOR", "label": "Octorotor"},
+    "15": {"class": "MULTIROTOR", "label": "Tricopter"},
+    "19": {"class": "VTOL", "label": "VTOL Tailsitter (duo)"},
+    "20": {"class": "VTOL", "label": "VTOL Tailsitter (quad)"},
+    "21": {"class": "VTOL", "label": "VTOL Tiltrotor"},
+    "22": {"class": "VTOL", "label": "VTOL Fixed-rotor"},
+    "23": {"class": "VTOL", "label": "VTOL Tailsitter"},
+    "24": {"class": "VTOL", "label": "VTOL Tiltwing"},
+    "25": {"class": "VTOL", "label": "VTOL"}
+  },
+
+  "mav_type_out_of_scope": {
+    "7": "Airship",
+    "8": "Free balloon",
+    "10": "Ground rover",
+    "11": "Surface boat",
+    "12": "Submarine"
+  }
+}

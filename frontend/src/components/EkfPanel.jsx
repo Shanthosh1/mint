@@ -14,13 +14,20 @@ const GAUGE_MAX = 1.5; // gauges scale 0..1.5 so the 1.0 gate sits at 2/3
  */
 export default function EkfPanel() {
   const ekf = useChannelState('ekf_metrics');
+  const unknown = ekf?.status === 'unknown' || ekf?.ratios == null;
   const ratios = ekf?.ratios ?? {};
 
   return (
     <div className="glass panel">
       <h2>EKF Innovation Ratios</h2>
       {!ekf && <div className="muted">Waiting for EKF_STATUS_REPORT stream…</div>}
-      {Object.entries(LABELS).map(([key, label]) => {
+      {ekf && unknown && (
+        <div className="alert critical">
+          EKF feed lost — gauges UNKNOWN. The last values are not live; do not
+          trust estimator health until the stream resumes.
+        </div>
+      )}
+      {!unknown && Object.entries(LABELS).map(([key, label]) => {
         const r = ratios[key] ?? 0;
         const cls = r >= 1.0 ? 'crit' : r >= 0.8 ? 'warn' : 'ok';
         return (

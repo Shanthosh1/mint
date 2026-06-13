@@ -25,7 +25,7 @@ router = APIRouter()
 _PASSTHROUGH = {
     "alert", "pilot_prompt", "proposal", "airframe",
     "connection", "param_written", "regime", "recommendation",
-    "flight_mode", "cascade_state",
+    "flight_mode", "cascade_state", "telemetry_stale",
 }
 
 

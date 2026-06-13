@@ -2,6 +2,10 @@
 
 MINT is a local, cross-platform ground station assistant designed to help field pilots tune PX4-based unmanned vehicles safely and analyze flight logs. It runs alongside ground control software (like QGroundControl) on the ground station laptop, dynamically splitting serial telemetry inputs into concurrent, independent streams for the pilot's GCS and its own real-time analysis engines.
 
+### Supported targets
+
+MINT is scoped to **PX4 firmware v1.14 or newer**, on **multirotor, fixed-wing (incl. flying-wing/delta), and VTOL** airframes only. Other autopilot stacks (e.g. ArduPilot) and out-of-scope vehicle types (rovers, boats, submarines, balloons, airships) are **rejected at connect/upload time** rather than analysed — their control architecture and message sets differ enough that MINT's advice would be unsafe. The gate is enforced on both the live link (`HEARTBEAT.autopilot`, MAVSDK firmware version, `SYS_AUTOSTART`/`MAV_TYPE` airframe class) and the offline ULog pipeline (`sys_name`, `ver_sw`, `SYS_AUTOSTART`).
+
 ---
 
 ## 🌟 Key Features

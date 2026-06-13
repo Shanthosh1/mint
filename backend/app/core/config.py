@@ -65,8 +65,25 @@ EKF_RATIO_WARN = float(_env("EKF_RATIO_WARN", "0.8"))     # amber threshold
 EKF_RATIO_FAIL = float(_env("EKF_RATIO_FAIL", "1.0"))     # red threshold
 
 # ---------------------------------------------------------------------------
+# Supported autopilot / firmware
+# ---------------------------------------------------------------------------
+# MINT targets PX4 only, from this firmware version onward. ArduPilot and
+# other stacks use different message sets, parameter names and EKF semantics,
+# so their telemetry would be silently misanalysed. The gate is enforced at
+# both the live connection and the ULog upload paths.
+MIN_PX4_VERSION = (
+    int(_env("MIN_PX4_MAJOR", "1")),
+    int(_env("MIN_PX4_MINOR", "14")),
+)
+MAV_AUTOPILOT_PX4 = 12          # MAV_AUTOPILOT_PX4 (HEARTBEAT.autopilot)
+
+# ---------------------------------------------------------------------------
 # ULog upload pipeline
 # ---------------------------------------------------------------------------
 ULOG_UPLOAD_CHUNK = 1024 * 1024            # 1 MiB chunks while spooling to disk
-ULOG_MAX_BYTES = 1024 * 1024 * 1024        # hard 1 GiB cap
+# Default upload cap. pyulog materialises whole datasets into pandas frames in
+# one shot, so a multi-hundred-MiB log can spike memory well past the file size
+# and OOM the backend — taking live telemetry down with it. The conservative
+# default protects 8 GiB field laptops; raise MINT_ULOG_MAX_MIB on a workstation.
+ULOG_MAX_BYTES = int(_env("ULOG_MAX_MIB", "800")) * 1024 * 1024
 ULOG_TMP_DIR = Path(_env("ULOG_TMP_DIR", str(Path.home() / ".mint" / "uploads")))

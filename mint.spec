@@ -17,7 +17,7 @@ Bundles:
   * the FastAPI backend,
   * the compiled SPA (frontend/dist),
   * the platform mavp2p router binary (resources/bin),
-  * the read-only safety registry JSON,
+  * the read-only safety registry + airframe ID JSON tables,
   * MAVSDK's mavsdk_server sidecar (no PyInstaller hook exists for it —
     omitting it makes vehicle connection fail only at runtime).
 """
@@ -36,6 +36,8 @@ datas = [
     # resources must land under app/, NOT backend/app/.
     (str(ROOT / "backend" / "app" / "core" / "safety_registry.json"),
      "app/core"),
+    (str(ROOT / "backend" / "app" / "mavlink" / "airframe_ids.json"),
+     "app/mavlink"),
     # MAVSDK spawns this sidecar relative to its own package directory.
     (str(MAVSDK_BIN), "mavsdk/bin"),
 ]

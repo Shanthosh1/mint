@@ -53,6 +53,10 @@ _PHASE_LAG_FACTOR = 2.0      # dynamic avg vs steady avg
 _PHASE_LAG_MIN = 0.5         # dynamic avg must also be materially high
 _PHASE_LAG_STEADY_MAX = 0.4  # steady avg must be healthy (else it's noise)
 
+# EKF feed staleness (a dead estimator stream, distinct from bad ratios).
+_STALE_CHECK_S = 0.5         # how often to test the EKF feed age
+_STALE_MAX_AGE_S = 2.0       # no EKF_STATUS_REPORT this long => UNKNOWN
+
 
 class EkfMonitor:
     """Streams innovation ratios; raises threshold + pattern alerts."""
@@ -64,21 +68,66 @@ class EkfMonitor:
         # per-(channel, regime) EMA of innovation ratios
         self._ema: dict[tuple[str, str], float] = {}
         self._task: asyncio.Task | None = None
+        self._stale_task: asyncio.Task | None = None
+        self._stale = False   # are we currently flagging EKF data as dead?
 
     def start(self) -> None:
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._run(), name="ekf-monitor")
+        if self._stale_task is None or self._stale_task.done():
+            self._stale_task = asyncio.create_task(
+                self._staleness_loop(), name="ekf-staleness")
 
     def stop(self) -> None:
         if self._task:
             self._task.cancel()
+        if self._stale_task:
+            self._stale_task.cancel()
 
     async def _run(self) -> None:
         async for event in HUB.subscribe():
             if event.channel == "vfr_hud":
                 self._track_throttle(event.payload)
             elif event.channel == "ekf_status":
+                if self._stale:
+                    # Data resumed — clear the UNKNOWN state.
+                    self._stale = False
+                    HUB.publish("alert", {
+                        "severity": "info", "source": "ekf",
+                        "text": "EKF status reports resumed — gauges live again.",
+                    })
                 self._process(event.payload)
+
+    async def _staleness_loop(self) -> None:
+        """Flag a dead EKF feed so the gauges show UNKNOWN, not stale green.
+
+        EKF_STATUS_REPORT can stop while attitude still streams (so the
+        generic telemetry watchdog won't catch it). Once EKF data has been
+        seen at least once, a gap longer than the threshold publishes an
+        UNKNOWN metrics state plus a one-shot alert.
+        """
+        try:
+            while True:
+                await asyncio.sleep(_STALE_CHECK_S)
+                seen = HUB.last_seen("ekf_status")
+                if seen is None:
+                    continue  # never started — nothing to call stale yet
+                if HUB.is_stale("ekf_status", _STALE_MAX_AGE_S):
+                    if not self._stale:
+                        self._stale = True
+                        HUB.publish("ekf_metrics", {
+                            "ratios": None, "flags": None,
+                            "regime": REGIME.current.value, "status": "unknown",
+                        })
+                        HUB.publish("alert", {
+                            "severity": "critical", "source": "ekf",
+                            "text": (f"No EKF status for >{_STALE_MAX_AGE_S:.0f}s — "
+                                     f"estimator gauges are UNKNOWN, not healthy. "
+                                     f"The EKF feed has stopped; do not trust the "
+                                     f"last shown values."),
+                        })
+        except asyncio.CancelledError:
+            pass
 
     # ------------------------------------------------------------------ #
     def _track_throttle(self, vfr: dict) -> None:
@@ -102,6 +151,7 @@ class EkfMonitor:
 
         HUB.publish("ekf_metrics", {
             "ratios": ratios, "flags": flags, "regime": REGIME.current.value,
+            "status": "ok",
         })
 
         self._update_regime_stats(ratios)

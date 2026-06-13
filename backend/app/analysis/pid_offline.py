@@ -80,15 +80,17 @@ def _find_step_indices(sp: np.ndarray) -> list[int]:
         if len(events) >= _MAX_EVENTS_PER_AXIS:
             break
     return events
-
-
-def _analyze_axis(t: np.ndarray, sp: np.ndarray, act: np.ndarray) -> dict:
+def _analyze_axis(t: np.ndarray, sp: np.ndarray, act: np.ndarray, step_mask: np.ndarray | None = None) -> dict:
     pre = int(_PRE_S * _RESAMPLE_HZ)
     post = int(_POST_S * _RESAMPLE_HZ)
     taus, settlings, overshoots = [], [], []
     win_sp, win_act = [], []
 
-    for i in _find_step_indices(sp):
+    indices = _find_step_indices(sp)
+    if step_mask is not None:
+        indices = [i for i in indices if step_mask[i]]
+
+    for i in indices:
         lo, hi = max(0, i - pre), min(len(sp), i + post)
         if hi - lo < pre + post // 2:
             continue
@@ -119,6 +121,7 @@ def _analyze_axis(t: np.ndarray, sp: np.ndarray, act: np.ndarray) -> dict:
         "nrmse": tm["nrmse"],
     })
     return out
+
 
 
 def _suggest(axis: str, stats: dict, airframe_class: str | None,
@@ -180,7 +183,8 @@ def analyze_pid(rates_sp: pd.DataFrame | None,
                 ang_vel: pd.DataFrame | None,
                 sensor: pd.DataFrame | None,
                 params: dict,
-                airframe_class: str | None) -> dict:
+                airframe_class: str | None,
+                status: pd.DataFrame | None = None) -> dict:
     """Full-log rate-tracking analysis. Returns per-axis stats + proposals."""
     if rates_sp is None:
         return {"skipped": "vehicle_rates_setpoint not logged — enable a "
@@ -214,11 +218,47 @@ def analyze_pid(rates_sp: pd.DataFrame | None,
         sp = np.interp(grid, *sp_u)
         act = np.interp(grid, *act_u)
 
-        stats = _analyze_axis(grid, sp, act)
-        axes[axis] = stats
-        recs, axis_notes = _suggest(axis, stats, airframe_class, params)
-        recommendations += recs
-        notes += axis_notes
+        # Build grid_vtype to classify steps
+        grid_vtype = None
+        if status is not None and "vehicle_type" in status.columns:
+            # vehicle_status timestamps are in microseconds
+            t_status = status["timestamp"].to_numpy(np.float64) / 1e6
+            vtype = status["vehicle_type"].to_numpy(np.float64)
+            if len(t_status) > 0:
+                grid_vtype = np.round(np.interp(grid, t_status, vtype))
+
+        if airframe_class == "VTOL":
+            # VTOL splits into Rotary-wing (1) and Fixed-wing (2)
+            mc_mask = (grid_vtype == 1) if grid_vtype is not None else None
+            mc_stats = _analyze_axis(grid, sp, act, mc_mask)
+            fw_mask = (grid_vtype == 2) if grid_vtype is not None else None
+            fw_stats = _analyze_axis(grid, sp, act, fw_mask)
+
+            axes[axis] = {
+                "mc": mc_stats,
+                "fw": fw_stats,
+                "n_steps": mc_stats.get("n_steps", 0) + fw_stats.get("n_steps", 0)
+            }
+            mc_recs, mc_notes = _suggest(axis, mc_stats, "MULTIROTOR", params)
+            fw_recs, fw_notes = _suggest(axis, fw_stats, "FIXED_WING", params)
+            
+            # Prefix VTOL suggestions/notes to differentiate MC and FW modes
+            for r in mc_recs:
+                r["rationale"] = f"MC mode: {r['rationale']}"
+            for r in fw_recs:
+                r["rationale"] = f"FW mode: {r['rationale']}"
+
+            mc_notes = [f"{n.split(':', 1)[0]} (MC):{n.split(':', 1)[1]}" if ":" in n else f"(MC) {n}" for n in mc_notes]
+            fw_notes = [f"{n.split(':', 1)[0]} (FW):{n.split(':', 1)[1]}" if ":" in n else f"(FW) {n}" for n in fw_notes]
+
+            recommendations += mc_recs + fw_recs
+            notes += mc_notes + fw_notes
+        else:
+            stats = _analyze_axis(grid, sp, act, None)
+            axes[axis] = stats
+            recs, axis_notes = _suggest(axis, stats, airframe_class, params)
+            recommendations += recs
+            notes += axis_notes
 
     return {
         "airframe_class": airframe_class,
