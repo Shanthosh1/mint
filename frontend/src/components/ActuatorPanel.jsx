@@ -49,6 +49,7 @@ export default function ActuatorPanel() {
   const motors = act?.motor_norms;
   const surfaces = act?.surface_deflections;
   const railed = new Set(act?.railed_channels ?? []);
+  const balance = act?.motor_balance;   // present only during steady hover
 
   const showMotors = motors && motors.length > 0;
   const showSurfaces = surfaces && surfaces.length > 0;
@@ -66,10 +67,26 @@ export default function ActuatorPanel() {
           <div className="muted" style={{ fontSize: '0.74rem', marginBottom: 8 }}>
             Motor output {domain === 'hybrid' ? '(MC)' : ''} — red = saturated
           </div>
-          {motors.map((n, i) => (
-            <Bar key={`m${i}`} label={`M${i + 1}`} frac={n}
-                 text={`${Math.round(n * 100)}%`} />
-          ))}
+          {motors.map((n, i) => {
+            const worst = balance && !balance.balanced && balance.worst_motor === i + 1;
+            return (
+              <Bar key={`m${i}`} label={`M${i + 1}${worst ? ' ⚠' : ''}`} frac={n}
+                   text={`${Math.round(n * 100)}%`} />
+            );
+          })}
+          {balance && (
+            <div className="muted" style={{ fontSize: '0.74rem', marginTop: 4 }}>
+              {balance.balanced ? (
+                <>⚖ Hover balance OK — motors within ±{Math.round((balance.worst_dev ?? 0) * 100)}% of mean</>
+              ) : (
+                <span style={{ color: 'var(--warn)' }}>
+                  ⚖ Hover imbalance — M{balance.worst_motor} runs{' '}
+                  {Math.round(Math.abs(balance.worst_dev) * 100)}% off the others
+                  (prop wear / ESC drift / CG)
+                </span>
+              )}
+            </div>
+          )}
         </>
       )}
 

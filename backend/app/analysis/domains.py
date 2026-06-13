@@ -25,6 +25,7 @@ import time
 from collections import deque
 
 from ..mavlink.telemetry_hub import HUB
+from .regime import REGIME, Regime
 
 DOMAIN_BY_CLASS = {
     "MULTIROTOR": "differential_thrust",
@@ -41,6 +42,16 @@ _SUSTAIN_FRACTION = 0.6    # saturated this share of the window => alert
 _AIRSPEED_REF_WINDOW_S = 30.0
 _ALERT_COOLDOWN_S = 15.0
 
+# Motor balance (steady hover only). A quad runs motors at different outputs
+# in level hover to counter prop yaw torque and CG offset; that differential
+# is symmetric about the mean and cancels when each motor's output is
+# *time-averaged* over a hover window. What remains after averaging is a
+# persistent asymmetry — the fault we flag (prop wear, ESC drift, CG offset).
+_BALANCE_WINDOW_S = 4.0        # hover averaging window
+_BALANCE_MIN_SAMPLES = 20      # need enough hover samples to trust the average
+_BALANCE_WARN_FRAC = 0.15      # a motor avg >15% off the fleet mean => advisory
+_BALANCE_ALERT_COOLDOWN_S = 60.0
+
 
 def domain_for(airframe_class: str | None) -> str | None:
     return DOMAIN_BY_CLASS.get(airframe_class or "")
@@ -54,6 +65,9 @@ class ActuationMonitor:
         self._airspeed: float = 0.0
         self._airspeed_hist: deque[tuple[float, float]] = deque()
         self._sat_hist: deque[tuple[float, bool]] = deque()
+        # Per-motor rolling (ts, normalized-output) history for the hover
+        # balance check; index i tracks motor i+1.
+        self._motor_hist: dict[int, deque[tuple[float, float]]] = {}
         self._last_alert: dict[str, float] = {}
         self._task: asyncio.Task | None = None
 
@@ -118,6 +132,9 @@ class ActuationMonitor:
                                   text="Motor saturation: one or more motors pinned at "
                                        "maximum output. Reduce aggressive rate gains, "
                                        "payload, or maneuver intensity.")
+            balance = self._check_motor_balance(norms, now)
+            if balance is not None:
+                payload["motor_balance"] = balance
 
         if self._domain in ("aerodynamic_surface", "hybrid"):
             defl = [(v - _PWM_MID) / _PWM_RANGE for v in valid]
@@ -144,6 +161,71 @@ class ActuationMonitor:
                 self._sustained_check("surface_lo_q", False, now, "", "")
 
         HUB.publish("actuation", payload)
+
+    def _check_motor_balance(self, norms: list[float], now: float) -> dict | None:
+        """Sustained per-motor asymmetry during steady hover.
+
+        Only meaningful in STEADY_HOLD: outside it, differential thrust is
+        the pilot/controller maneuvering, not a fault. Accumulates each
+        motor's output over a hover window, then compares time-averaged
+        outputs — the legitimate yaw-torque differential averages out, so a
+        motor whose *average* sits >15% off the fleet mean indicates uneven
+        prop wear, ESC calibration drift, or CG imbalance.
+
+        Returns a balance summary for the UI (or None when not enough hover
+        data yet), and raises a cooldown-gated advisory when out of balance.
+        """
+        # Reset history the moment we leave steady hover so a maneuver's
+        # differential thrust never leaks into the next hover average.
+        if REGIME.current != Regime.STEADY_HOLD:
+            if self._motor_hist:
+                self._motor_hist.clear()
+            return None
+
+        horizon = now - _BALANCE_WINDOW_S
+        for i, n in enumerate(norms):
+            hist = self._motor_hist.setdefault(i, deque())
+            hist.append((now, n))
+            while hist and hist[0][0] < horizon:
+                hist.popleft()
+
+        # Every motor needs a full window of samples before we judge.
+        counts = [len(self._motor_hist.get(i, ())) for i in range(len(norms))]
+        if len(norms) < 3 or min(counts) < _BALANCE_MIN_SAMPLES:
+            return None
+
+        avgs = [sum(v for _, v in self._motor_hist[i]) / counts[i]
+                for i in range(len(norms))]
+        fleet_mean = sum(avgs) / len(avgs)
+        if fleet_mean <= 1e-3:
+            return None   # not actually spinning — ignore
+
+        deviations = [(a - fleet_mean) / fleet_mean for a in avgs]
+        worst_i = max(range(len(deviations)), key=lambda i: abs(deviations[i]))
+        worst_dev = deviations[worst_i]
+
+        summary = {
+            "mean": round(fleet_mean, 3),
+            "avgs": [round(a, 3) for a in avgs],
+            "deviations": [round(d, 3) for d in deviations],
+            "worst_motor": worst_i + 1,
+            "worst_dev": round(worst_dev, 3),
+            "balanced": abs(worst_dev) < _BALANCE_WARN_FRAC,
+        }
+
+        if (abs(worst_dev) >= _BALANCE_WARN_FRAC
+                and now - self._last_alert.get("balance", 0) > _BALANCE_ALERT_COOLDOWN_S):
+            self._last_alert["balance"] = now
+            hi_lo = "higher" if worst_dev > 0 else "lower"
+            HUB.publish("alert", {
+                "severity": "warning", "source": "actuation",
+                "text": (f"Motor imbalance in hover: motor {worst_i + 1} averages "
+                         f"{abs(worst_dev) * 100:.0f}% {hi_lo} than the others. A "
+                         f"motor working consistently harder points to uneven prop "
+                         f"wear, ESC calibration drift, or a CG offset — inspect "
+                         f"props/mount and check balance before tuning."),
+            })
+        return summary
 
     def _sustained_check(self, key: str, condition: bool, now: float,
                          severity: str, text: str) -> None:
