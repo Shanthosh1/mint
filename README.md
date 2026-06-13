@@ -11,7 +11,22 @@ To make things easy, MINT runs a small telemetry proxy (`mavp2p`) in the backgro
 > 
 > Always land and disarm your vehicle before closing the MINT application.
 
-### Supported Vehicles & Software
+---
+
+## Table of Contents
+* [Supported Vehicles & Software](#-supported-vehicles--software)
+* [Core Features](#-core-features)
+* [How it Works](#-how-it-works)
+* [The Safety Invariants](#️-the-safety-invariants)
+* [Local Development](#️-local-development)
+* [Building the Executable](#-building-the-executable)
+* [Technical Reference & Operational Details](#-technical-reference--operational-details)
+* [AI Credits & Disclaimer](#-ai-credits--disclaimer)
+* [License](#-license)
+
+---
+
+## Supported Vehicles & Software
 * **Autopilot**: PX4 firmware v1.14 or newer.
 * **Airframes**: Multirotors, standard Fixed-Wing planes, Flying Wings/Deltas, and VTOLs.
 * **Unsupported Vehicles**: Ground rovers, boats, submarines, balloons, and helicopters are explicitly blocked. Because their control structures differ so much from standard fixed-wing and multirotor rate cascades, applying MINT's advice to them would be unsafe.
@@ -115,6 +130,36 @@ cd frontend && npm install && npm run build && cd ..
 ```
 
 We also have a GitHub Actions workflow configured in [.github/workflows/build.yml](.github/workflows/build.yml) that builds and uploads zipped binaries for Windows, macOS, and Linux on every release or push.
+
+---
+
+## Technical Reference & Operational Details
+
+### 1. Telemetry Rate Limits
+* **Maximum Telemetry Rate**: MINT can comfortably process telemetry rates up to **200 Hz** over the loopback network. 
+* **Recommended Rate**: For physical telemetry radios (such as SiK radios), it is recommended to set your MAVLink stream rates (e.g. `SR0_*` parameters in PX4) between **50 Hz and 100 Hz** to avoid saturating the radio bandwidth while maintaining high-fidelity data resolution for real-time PID analysis.
+
+### 2. Multi-Source Telemetry Routing
+* **Collision Behavior**: MINT's backend and the underlying `mavp2p` router route telemetry packages based on MAVLink System ID (SYSID). 
+* **Routing Logic**:
+  * If two telemetry streams with **different SYSIDs** are received, MINT treats them as separate vehicles.
+  * If two telemetry streams (e.g. two radios transmitting on the same network frequency/ports) send messages under the **same SYSID**, packets from both vehicles will interleave on the same channel. This will cause state thrashing, false EKF alerts, and PID analysis anomalies. **Always ensure each vehicle on the telemetry link has a unique SYSID.**
+
+### 3. Running with SITL (Software-in-the-Loop)
+To run MINT locally against a simulated PX4 SITL drone for development or testing:
+1. **Launch SITL**: Start your PX4 SITL simulation. By default, it will broadcast a MAVLink stream on UDP port `14540` (and sometimes `14550`).
+2. **Start MINT**: In the MINT UI, go to the connection configuration and specify the connection mode as **UDP Listen (Bind)** on port `14540`.
+3. **Automatic Routing**: MINT's `mavp2p` proxy will capture the SITL stream, route it internally to MINT's analysis modules, and expose a forwarded output on `127.0.0.1:14550`.
+4. **Connect QGC**: Open QGroundControl on the same computer. It will automatically connect to the forwarded stream on `14550`, allowing you to fly the simulated drone while MINT performs real-time PID and EKF analysis.
+
+### 4. API Response & Error References
+MINT's API uses standard HTTP response codes to communicate errors:
+* **`413 Payload Too Large`**: Returned by the ULog upload pipeline (`/api/ulog`) if the uploaded `.ulg` file size exceeds the configured `ULOG_MAX_MIB` (default: 800 MiB).
+* **`422 Unprocessable Entity`**: Returned during vehicle handshakes or log analysis if:
+  * The autopilot stack is not PX4 (e.g., ArduPilot).
+  * The firmware version is older than PX4 v1.14.
+  * The airframe class resolves to an out-of-scope vehicle (rover, boat, submarine, balloon, airship).
+* **`409 Conflict`**: Returned by system connection endpoints if you attempt to start a telemetry connection before the backend's `mavp2p` router subprocess is running.
 
 ---
 
