@@ -1,33 +1,43 @@
-# MINT — MAVLink Intelligent Tuning Assistant
+# MINT: MAVLink Intelligent Tuning Assistant
 
-MINT is a local, cross-platform ground station assistant designed to help field pilots tune PX4-based unmanned vehicles safely and analyze flight logs. It runs alongside ground control software (like QGroundControl) on the ground station laptop, dynamically splitting serial telemetry inputs into concurrent, independent streams for the pilot's GCS and its own real-time analysis engines.
+MINT is a desktop companion tool for drone and aircraft pilots running the PX4 autopilot. It runs locally on your ground station laptop alongside QGroundControl to help you safely tune control loops and analyze flight logs in the field.
 
-### Supported targets
+To make things easy, MINT runs a small telemetry proxy (`mavp2p`) in the background. You plug in your vehicle's telemetry link, and MINT splits it into separate streams for your Ground Control Station (GCS) and its own real-time analysis engines—meaning you don't have to fiddle with serial ports or lose your telemetry connection.
 
-MINT is scoped to **PX4 firmware v1.14 or newer**, on **multirotor, fixed-wing (incl. flying-wing/delta), and VTOL** airframes only. Other autopilot stacks (e.g. ArduPilot) and out-of-scope vehicle types (rovers, boats, submarines, balloons, airships) are **rejected at connect/upload time** rather than analysed — their control architecture and message sets differ enough that MINT's advice would be unsafe. The gate is enforced on both the live link (`HEARTBEAT.autopilot`, MAVSDK firmware version, `SYS_AUTOSTART`/`MAV_TYPE` airframe class) and the offline ULog pipeline (`sys_name`, `ver_sw`, `SYS_AUTOSTART`).
+> [!WARNING]
+> **Operational Safety Warning: Do Not Close MINT While Flying!**
+> 
+> Because MINT acts as the telemetry proxy routing data to QGroundControl, **closing MINT cleanly while your vehicle is in the air will cut the telemetry feed to QGC**. QGC will immediately report a connection loss, and the vehicle will trigger its configured **Data Link Failsafe** (typically executing Return-to-Launch, Land, or Hover depending on your PX4 parameters).
+> 
+> Always land and disarm your vehicle before closing the MINT application.
+
+### Supported Vehicles & Software
+* **Autopilot**: PX4 firmware v1.14 or newer.
+* **Airframes**: Multirotors, standard Fixed-Wing planes, Flying Wings/Deltas, and VTOLs.
+* **Unsupported Vehicles**: Ground rovers, boats, submarines, balloons, and helicopters are explicitly blocked. Because their control structures differ so much from standard fixed-wing and multirotor rate cascades, applying MINT's advice to them would be unsafe.
 
 ---
 
-## 🌟 Key Features
+## 🌟 Core Features
 
-* **Real-time Rate-Loop Analysis**: Computes non-dimensional time constants ($\tau$), Pearson correlation coefficients ($r$), and Normalized Root-Mean-Square Error (NRMSE) metrics on live attitude target vs. response data.
-* **EKF Diagnostics & Innovation Watchdog**: Monitors EKF status reports, tracking stick inputs and regimes to diagnose magnetic, vibration, and sensor phase-lag issues.
-* **Offline ULog Analysis Pipeline**: Supports bulk uploads of flight logs (>100 MB), parses gyroscope FFT spectra, isolates vibration peaks, and provides coordinated notch/cutoff filter recommendations.
-* **Human-In-The-Loop Safety Model**: Enforces double-validation on all parameter changes. MINT *never* writes a parameter automatically—every recommendation is staged as a proposal requiring explicit pilot approval.
-* **Dynamic Connection Manager**: Runs a telemetry proxy subprocess to fan out serial or UDP MAVLink feeds to QGC (14550), MAVSDK control (14540), and raw data analyzers (14541) with auto-resolved port collision handling.
+* **Real-Time PID Rate Tuning**: Monitors live pilot inputs vs. the vehicle's actual response. MINT measures response speed (time constant $\tau$), tracking quality (correlation $r$), and overshoot to suggest concrete gain changes.
+* **Offline ULog Analysis**: Upload your flight logs (even large files) to get a full post-flight report. It runs FFTs on your gyro data to identify vibration spikes and recommend exact notch/cutoff filter frequencies.
+* **VTOL Support**: For VTOL aircraft, the log analyzer dynamically splits its analysis between multicopter (hover) and fixed-wing (forward flight) phases so you don't mix up your parameters.
+* **EKF Diagnostics**: Keeps an eye on EKF status and pilot stick movements to diagnose vibration, sensor lag, or compass interference issues.
+* **Safety First**: MINT will *never* write a parameter to your vehicle automatically. It only stages modifications as "proposals" in a staging area. You have to review and approve them before anything is sent to the vehicle.
 
 ---
 
-## 📐 Architecture
+## How it Works
 
 ```
                     ┌────────────────────────────────────────────────────────┐
                     │                     Ground Station                     │
                     │  mavp2p router (managed subprocess)                    │
-  Source            │    ├── UDP 127.0.0.1:14550 ──▶ QGroundControl          │
-  ──────────▶       │    ├── UDP 127.0.0.1:14540 ──▶ MAVSDK   (control plane)│
-  Serial / USB      │    └── UDP 127.0.0.1:14541 ──▶ pymavlink (data plane)  │
-  UDP / TCP         │                                                        │
+                    │    ├── UDP 127.0.0.1:14550 ──▶ QGroundControl          │
+                    │    ├── UDP 127.0.0.1:14540 ──▶ MAVSDK   (control plane)│
+                    │    └── UDP 127.0.0.1:14541 ──▶ pymavlink (data plane)  │
+                    │                                                        │
                     │  FastAPI Backend (asyncio + thread pools)              │
                     │    ├── TelemetryHub (Pub/Sub Event Bus)                │
                     │    ├── LivePidEngine · EkfMonitor · CascadeAnalyzer    │
@@ -40,50 +50,50 @@ MINT is scoped to **PX4 firmware v1.14 or newer**, on **multirotor, fixed-wing (
 
 ---
 
-## 🛡️ Safety Model (Non-Negotiable Invariants)
+## The Safety Invariants
 
-1. **No Automated Writes**: MINT strictly generates *proposals*. Writes to the autopilot are only executed when the pilot explicitly clicks **Approve & Write**.
-2. **Whitelist Registry**: Only parameters registered in `backend/app/core/safety_registry.json` for the auto-detected airframe type are allowed to be modified.
-3. **Double Verification**: Proposed delta changes are validated at creation and re-validated against the live on-vehicle state at write-time (blocking the action if the baseline parameter was modified externally).
-4. **Airframe Class Isolation**: Parameter proposals are disabled until the vehicle's `SYS_AUTOSTART` or `MAV_TYPE` is successfully read and mapped.
+MINT is built around a few non-negotiable safety rules to protect your vehicle:
+1. **Strictly Manual Writes**: All recommendations are staged. No parameters are changed unless you click **Approve & Write**.
+2. **Whitelist Protection**: You can only modify parameters that are registered in `backend/app/core/safety_registry.json` for your specific vehicle class.
+3. **Pre-Write Verification**: When you write a parameter, MINT verifies it against the current vehicle state first. If the baseline changed on the vehicle since the recommendation was made, the write is blocked.
+4. **Locked Airframe Mapping**: You cannot write or stage parameters until MINT successfully identifies the vehicle's `SYS_AUTOSTART` or `MAV_TYPE`.
 
 ---
 
-## 🛠️ Development Setup
+## Local Development
 
-### Backend Setup (Python >= 3.10)
+### 1. Backend Setup (Python >= 3.10)
 ```bash
-# Create and activate virtual environment
+# Create and activate a virtual environment
 python3 -m venv .venv
 source .venv/bin/activate
 
 # Install dependencies
 pip install -r requirements.txt
 
-# Run backend (dev mode - port 8400)
+# Run backend (runs on port 8400 by default)
 python backend/main.py
 ```
 
-### Frontend Setup (Node.js >= 18)
-In a separate terminal shell:
+### 2. Frontend Setup (Node.js >= 18)
+In a separate terminal:
 ```bash
 cd frontend
 npm install
 npm run dev
 ```
 
-### Telemetry Router Binary
-MINT bundles `mavp2p` as its telemetry proxy. Build or copy your platform-specific binary into `resources/bin/` first (see [resources/bin/README.md](resources/bin/README.md) for compiling/obtaining prebuilt binaries).
+### 3. Telemetry Router Binary
+MINT relies on `mavp2p` to route telemetry. Place a platform-specific binary of `mavp2p` in `resources/bin/` (see [resources/bin/README.md](resources/bin/README.md) for build instructions).
 
 ---
 
-## 📦 Building the Executable
+## Building the Executable
 
-MINT is built as a single-folder distribution (`ONEDIR` target to avoid expensive decompression latency of SciPy/MAVSDK packages on every launch).
+MINT is packaged as a single-folder executable (to avoid slow decompression of heavy SciPy/Pandas dependencies on every launch).
 
-### Recommended (Automated)
-Run the automated build script matching your operating system in the project root:
-
+### Automated Builds
+We've included scripts to handle everything (frontend build, virtual environment setup, packaging) in one go:
 * **macOS / Linux**:
   ```bash
   ./build.sh
@@ -93,29 +103,27 @@ Run the automated build script matching your operating system in the project roo
   ./build.ps1
   ```
 
-### Manual Steps
-If you prefer to run the steps manually:
-
+### Manual Packaging
+If you want to run the build steps yourself:
 ```bash
-# 1. Compile the React UI
+# Build the React frontend SPA
 cd frontend && npm install && npm run build && cd ..
 
-# 2. Package the bundle
-pyinstaller mint.spec
-# Output folder will be created at → dist/mint/
+# Package with PyInstaller
+.venv/bin/python -m PyInstaller mint.spec
+# The output will be located in dist/mint/
 ```
 
-### Automated CI/CD
-MINT is configured with a GitHub Actions pipeline ([.github/workflows/build.yml](.github/workflows/build.yml)) to build, package, and upload zipped binaries for **Windows**, **macOS**, and **Linux** on every push.
+We also have a GitHub Actions workflow configured in [.github/workflows/build.yml](.github/workflows/build.yml) that builds and uploads zipped binaries for Windows, macOS, and Linux on every release or push.
 
 ---
 
 ## 🤖 AI Credits & Disclaimer
 
-This application was developed with the assistance of agentic AI coding tools. AI assistance was primarily utilized to accelerate React frontend development and optimize overall coding standards and patterns across the codebase.
+This application was developed with the assistance of agentic AI coding tools. Agentic AI was utilized to design and build the entire React frontend, and to optimize the Python backend codebase, taking it from an initial proof-of-concept (POC) state into a robust, deployment-ready application.
 
 ---
 
 ## 📄 License
 
-MINT is released under the [MIT License](LICENSE).
+MINT is open-source software released under the [MIT License](LICENSE).
