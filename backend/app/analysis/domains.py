@@ -112,6 +112,8 @@ class ActuationMonitor:
             sat_index = sum(1 for n in norms if n >= _MOTOR_SAT) / len(norms)
             payload["motor_sat_index"] = round(sat_index, 2)
             payload["motor_max"] = round(max(norms), 2)
+            # Per-channel normalized outputs (0..1) for the live bar display.
+            payload["motor_norms"] = [round(n, 3) for n in norms]
             self._sustained_check("motor", sat_index > 0, now, severity="warning",
                                   text="Motor saturation: one or more motors pinned at "
                                        "maximum output. Reduce aggressive rate gains, "

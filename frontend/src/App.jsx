@@ -2,6 +2,7 @@ import { useTelemetrySocket, useChannelState } from './hooks/useTelemetry.js';
 import ConnectionPanel from './components/ConnectionPanel.jsx';
 import PidPanel from './components/PidPanel.jsx';
 import EkfPanel from './components/EkfPanel.jsx';
+import ActuatorPanel from './components/ActuatorPanel.jsx';
 import AlertStack from './components/AlertStack.jsx';
 import ProposalsPanel from './components/ProposalsPanel.jsx';
 import UlogPanel from './components/UlogPanel.jsx';
@@ -49,6 +50,7 @@ export default function App() {
         <div className="col">
           <ConnectionPanel />
           <EkfPanel />
+          <ActuatorPanel />
         </div>
         <div className="col col-main">
           <PidPanel />
