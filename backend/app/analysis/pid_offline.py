@@ -43,12 +43,12 @@ _SP_COLS = {"roll": "roll", "pitch": "pitch", "yaw": "yaw"}
 _ACT_COLS = {"roll": "xyz[0]", "pitch": "xyz[1]", "yaw": "xyz[2]"}
 _GYRO_COLS = {"roll": "gyro_rad[0]", "pitch": "gyro_rad[1]", "yaw": "gyro_rad[2]"}
 
-# Axis -> rate P parameter, per safety class.
+# Axis -> rate parameter (P for MC, FF for FW), per safety class.
 _RATE_P_PARAM = {
     "MULTIROTOR": {"roll": "MC_ROLLRATE_P", "pitch": "MC_PITCHRATE_P", "yaw": "MC_YAWRATE_P"},
     "VTOL": {"roll": "MC_ROLLRATE_P", "pitch": "MC_PITCHRATE_P", "yaw": None},
-    "FIXED_WING": {"roll": "FW_RR_P", "pitch": "FW_PR_P", "yaw": "FW_YR_P"},
-    "DELTA_WING": {"roll": "FW_RR_P", "pitch": "FW_PR_P", "yaw": None},
+    "FIXED_WING": {"roll": "FW_RR_FF", "pitch": "FW_PR_FF", "yaw": "FW_YR_FF"},
+    "DELTA_WING": {"roll": "FW_RR_FF", "pitch": "FW_PR_FF", "yaw": None},
 }
 
 
@@ -154,6 +154,9 @@ def _suggest(axis: str, stats: dict, airframe_class: str | None,
                      f"resolved for airframe class {airframe_class}.")
         return recs, notes
 
+    is_ff = "FF" in param
+    damping_note = "" if is_ff else " (or raise rate D)"
+
     if overshoot > _OVERSHOOT_LIMIT:
         recs.append({
             "param": param,
@@ -161,8 +164,8 @@ def _suggest(axis: str, stats: dict, airframe_class: str | None,
             "rationale": (
                 f"{axis} overshoot peaked at {overshoot*100:.0f}% of step "
                 f"amplitude across {stats['n_steps']} maneuvers "
-                f"(τ={tau}s). Reduce {param} ~{int(_GAIN_TRIM*100)}% "
-                f"(or raise rate D) to damp the response."),
+                f"(τ={tau}s). Reduce {param} ~{int(_GAIN_TRIM*100)}%{damping_note} "
+                f"to damp the response."),
         })
     elif tau is not None and settling is not None and settling > 4 * tau:
         recs.append({

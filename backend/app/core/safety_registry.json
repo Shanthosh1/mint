@@ -37,6 +37,9 @@
     "EKF2_GYR_NOISE":   { "max_step": 0.005, "abs_min": 0.0001, "abs_max": 0.1 }
   },
   "FIXED_WING": {
+    "FW_RR_FF": { "max_step": 0.05, "abs_min": 0.0,   "abs_max": 2.0 },
+    "FW_PR_FF": { "max_step": 0.05, "abs_min": 0.0,   "abs_max": 2.0 },
+    "FW_YR_FF": { "max_step": 0.05, "abs_min": 0.0,   "abs_max": 2.0 },
     "FW_RR_P":  { "max_step": 0.02, "abs_min": 0.005, "abs_max": 0.5 },
     "FW_RR_I":  { "max_step": 0.02, "abs_min": 0.0,   "abs_max": 0.5 },
     "FW_PR_P":  { "max_step": 0.02, "abs_min": 0.005, "abs_max": 0.6 },
@@ -56,6 +59,8 @@
     "EKF2_GYR_NOISE":   { "max_step": 0.005, "abs_min": 0.0001, "abs_max": 0.1 }
   },
   "DELTA_WING": {
+    "FW_RR_FF": { "max_step": 0.05, "abs_min": 0.0,   "abs_max": 2.0 },
+    "FW_PR_FF": { "max_step": 0.05, "abs_min": 0.0,   "abs_max": 2.0 },
     "FW_RR_P":  { "max_step": 0.015, "abs_min": 0.005, "abs_max": 0.4 },
     "FW_RR_I":  { "max_step": 0.015, "abs_min": 0.0,   "abs_max": 0.4 },
     "FW_PR_P":  { "max_step": 0.015, "abs_min": 0.005, "abs_max": 0.5 },
@@ -87,6 +92,9 @@
     "MPC_Z_P":          { "max_step": 0.1, "abs_min": 0.3, "abs_max": 1.5 },
     "FW_R_TC":        { "max_step": 0.05, "abs_min": 0.2, "abs_max": 0.8 },
     "FW_P_TC":        { "max_step": 0.05, "abs_min": 0.2, "abs_max": 0.8 },
+    "FW_RR_FF":       { "max_step": 0.05, "abs_min": 0.0,   "abs_max": 2.0 },
+    "FW_PR_FF":       { "max_step": 0.05, "abs_min": 0.0,   "abs_max": 2.0 },
+    "FW_YR_FF":       { "max_step": 0.05, "abs_min": 0.0,   "abs_max": 2.0 },
     "FW_RR_P":        { "max_step": 0.015, "abs_min": 0.005, "abs_max": 0.4 },
     "FW_PR_P":        { "max_step": 0.015, "abs_min": 0.005, "abs_max": 0.5 },
     "FW_AIRSPD_TRIM": { "max_step": 1.0, "abs_min": 10.0, "abs_max": 35.0 },
