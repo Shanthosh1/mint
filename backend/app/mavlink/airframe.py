@@ -128,9 +128,19 @@ def classify_airframe(sys_autostart: int) -> AirframeInfo:
     sim = _SIM_IDS.get(sys_autostart)
     if sim is not None:
         cls, label = sim
+        if cls not in SUPPORTED_CLASSES:
+            raise UnsupportedAirframeError(
+                f"{label} (SYS_AUTOSTART={sys_autostart}) is not a supported "
+                f"airframe class: must be one of {list(SUPPORTED_CLASSES)}."
+            )
         return AirframeInfo(sys_autostart, cls, label)
     for lo, hi, cls, label in _RANGES:
         if lo <= sys_autostart <= hi:
+            if cls not in SUPPORTED_CLASSES:
+                raise UnsupportedAirframeError(
+                    f"{label} (SYS_AUTOSTART={sys_autostart}) is not a supported "
+                    f"airframe class: must be one of {list(SUPPORTED_CLASSES)}."
+                )
             return AirframeInfo(sys_autostart, cls, label)
     raise UnsupportedAirframeError(
         f"SYS_AUTOSTART={sys_autostart} is not a multirotor, fixed-wing or "

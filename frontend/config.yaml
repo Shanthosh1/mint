@@ -1,0 +1,15 @@
+# MINT Frontend Configuration
+
+# WebSocket / connection settings
+reconnect_delay_ms: 1500
+
+# Actuator panel thresholds (normalized 0.0 - 1.0)
+actuator_panel:
+  warn_threshold: 0.8
+  sat_threshold: 1.0
+
+# uPlot live chart defaults
+live_loop_chart:
+  window_s: 30
+  zoom_factor: 0.75
+  min_zoom_range_s: 0.5

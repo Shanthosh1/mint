@@ -26,13 +26,20 @@ def recommend(param: str, rationale: str, *,
               delta: Optional[float] = None,
               target_value: Optional[float] = None,
               source: str = "live",
-              cooldown_s: float = 30.0) -> None:
+              cooldown_s: float = 30.0,
+              is_saturation_gain_reduction: bool = False,
+              confidence: Optional[str] = None,
+              limitations: Optional[str] = None) -> None:
     """Publish a structured recommendation (exactly one change form)."""
     forms = [v is not None for v in (scale_factor, delta, target_value)]
     if sum(forms) != 1:
         raise ValueError("recommend() needs exactly one of "
                          "scale_factor / delta / target_value")
     now = time.monotonic()
+    # Note: Cooldown is keyed by param name. For most params (e.g. MC_ROLLRATE_P vs MC_PITCHRATE_P,
+    # or FW_YR_P vs FW_PR_P), the param strings are distinct so they cooldown independently.
+    # If two axes ever share the exact same parameter name, the second axis would be suppressed
+    # during the cooldown, which is acceptable since they share the same physical parameter.
     if now - _last_emit.get(param, 0.0) < cooldown_s:
         return
     _last_emit[param] = now
@@ -43,4 +50,7 @@ def recommend(param: str, rationale: str, *,
         "target_value": target_value,
         "rationale": rationale,
         "source": source,
+        "is_saturation_gain_reduction": is_saturation_gain_reduction,
+        "confidence": confidence,
+        "limitations": limitations,
     })

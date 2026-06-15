@@ -1,0 +1,135 @@
+# MINT Central Configuration
+
+# HTTP / WebSocket Server
+server:
+  http_host: "127.0.0.1"
+  http_port: 8400
+
+# Telemetry routing ports (defaults)
+mavlink:
+  qgc_udp_port: 14550
+  mavsdk_udp_port: 14540
+  pymavlink_udp_port: 14541
+  default_baud: 57600
+  min_px4_major: 1
+  min_px4_minor: 14
+  mav_autopilot_px4: 12
+  connection:
+    watchdog_period_s: 1.0
+    stale_max_age_s: 2.0
+    param_read_attempts: 3
+    param_retry_base_s: 0.25
+
+# Live analysis windows
+analysis:
+  ws_stream_hz: 10.0
+  rmse_window_s: 5.0
+  stick_idle_timeout_s: 10.0
+  ekf_ratio_warn: 0.8
+  ekf_ratio_fail: 1.0
+  
+  # Analysis-specific constants
+  actuator_saturation:
+    sat_eps: 0.005
+    burst_warn_s: 0.2
+    
+  vtol:
+    stuck_after_s: 8.0
+    stuck_alt_loss_m: 3.0
+    dip_watch_s: 3.0
+    dip_pitch_deg: -10.0
+    dip_alt_loss_m: 2.0
+    hover_airspeed_max: 4.0
+    elevon_fight_std: 0.25
+    alert_cooldown_s: 30.0
+    
+  filter_advisor:
+    hf_band_hz: 40.0
+    gyro_noisy_rms: 0.04
+    gyro_clean_rms: 0.012
+    accel_noisy_rms: 0.5
+    harmonic_tol: 0.08
+    delay_raise_ms: 8.0
+    
+  vibration_live:
+    vib_warn: 30.0
+    vib_crit: 60.0
+    clip_window_s: 30.0
+    alert_cooldown_s: 30.0
+    stale_s: 2.0
+    never_streamed_s: 10.0
+    
+  ekf_offline:
+    max_lag_s: 0.5
+    hover_min_s: 5.0
+    hover_gyro_rms: 0.06
+    
+  stick_monitor:
+    rail_threshold: 950.0
+    rail_window_s: 30.0
+    rail_fraction: 0.2
+    rail_min_samples: 50
+    variance_floor: 25.0
+    compliance_peak: 400.0
+    compliance_reversals: 3
+    
+  live_pid:
+    window_s: 3.0
+    eval_period_s: 0.5
+    r_depletion: 0.85
+    high_rate_rad_s: 0.8
+    overshoot_limit: 0.15
+    osc_crossings: 2
+    settle_band: 0.2
+    offset_window_s: 3.0
+    offset_min_span_s: 2.0
+    offset_deg: 2.0
+    offset_max_std_deg: 1.5
+    aspd_samples: 60
+    aspd_min_per_bin: 10
+    aspd_ratio: 1.8
+    aspd_min_nrmse: 0.25
+    min_amp: 0.10
+    alert_cooldown_s: 15.0
+
+  cascade:
+    attitude_min_amp_deg: 5.0
+    velocity_min_amp: 0.5
+    position_min_amp: 1.0
+    
+  domains:
+    pwm_min: 1000.0
+    pwm_mid: 1500.0
+    pwm_range: 500.0
+    motor_sat: 0.98
+    surface_rail: 0.96
+    sustain_window_s: 1.5
+    sustain_fraction: 0.6
+    airspeed_ref_window_s: 30.0
+    alert_cooldown_s: 15.0
+    balance_window_s: 4.0
+    balance_min_samples: 20
+    balance_warn_frac: 0.15
+    balance_alert_cooldown_s: 60.0
+
+  regime:
+    variance_window_s: 2.0
+    dynamic_variance: 15000.0
+    dwell_s: 0.7
+    inflight_throttle_pct: 12.0
+    inflight_speed_m_s: 1.5
+    vfr_stale_s: 5.0
+
+# ULog upload pipeline
+ulog:
+  upload_chunk: 1048576  # 1024 * 1024
+  max_mib: 800
+  tmp_dir: "~/.mint/uploads"
+
+# Tuning feedback memory
+tuning_history:
+  path: "~/.mint/tuning_history.jsonl"
+
+# Expert Mode Settings
+expert_mode:
+  enabled: false

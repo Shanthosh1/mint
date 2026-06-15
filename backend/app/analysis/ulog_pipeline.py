@@ -55,6 +55,7 @@ def _parse_px4_version(ver_sw: str | None) -> tuple[int, int, int] | None:
 _DATASETS = [
     "sensor_combined",
     "actuator_controls_0",
+    "actuator_outputs",
     "vehicle_local_position",
     "vehicle_gps_position",
     "sensor_baro",
@@ -64,6 +65,7 @@ _DATASETS = [
     "vehicle_rates_setpoint",     # commanded body rates (PID analysis)
     "vehicle_air_data",           # baro altitude (EKF2_BARO_DELAY)
     "vehicle_status",
+    "vtol_vehicle_status",
 ]
 
 
@@ -110,6 +112,85 @@ def dataset_frame(ulog: ULog, name: str, instance: int = 0) -> pd.DataFrame | No
     except (KeyError, IndexError, ValueError):
         return None
     return pd.DataFrame(ds.data)
+
+
+def _discover_actuators_from_params(params: dict, airframe_class: str) -> dict:
+    """Reconstruct the actuator_map dictionary from ULog initial parameters dictionary."""
+    actuator_map = {
+        "hover_motors": [],
+        "thrust_motors": [],
+        "control_surfaces": [],
+        "tilt_servos": []
+    }
+
+    # 1. Identify parameter family
+    selected_family = None
+    if "ACT_FUNC1" in params:
+        selected_family = "ACT_FUNC"
+    elif "SIM_GZ_EC_FUNC1" in params:
+        selected_family = "SIM_GZ"
+    elif "HIL_ACT_FUNC1" in params:
+        selected_family = "HIL"
+    elif "PWM_MAIN_FUNC1" in params:
+        selected_family = "PWM"
+
+    if not selected_family:
+        return actuator_map
+
+    def map_func(func_val: int, channel_idx: int):
+        if 101 <= func_val <= 112:
+            if airframe_class == "MULTIROTOR":
+                actuator_map["hover_motors"].append(channel_idx)
+            elif airframe_class in ("FIXED_WING", "DELTA_WING"):
+                actuator_map["thrust_motors"].append(channel_idx)
+            elif airframe_class == "VTOL":
+                if 101 <= func_val <= 104:
+                    actuator_map["hover_motors"].append(channel_idx)
+                else:
+                    actuator_map["thrust_motors"].append(channel_idx)
+        elif 201 <= func_val <= 208:
+            actuator_map["control_surfaces"].append(channel_idx)
+        elif 301 <= func_val <= 308:
+            actuator_map["tilt_servos"].append(channel_idx)
+
+    # 2. Extract configuration
+    if selected_family == "ACT_FUNC":
+        for i in range(1, 17):
+            val = params.get(f"ACT_FUNC{i}")
+            if val is not None and int(val) > 0:
+                map_func(int(val), i - 1)
+    elif selected_family == "SIM_GZ":
+        num_esc = 0
+        for i in range(1, 9):
+            val = params.get(f"SIM_GZ_EC_FUNC{i}")
+            if val is not None and int(val) > 0:
+                num_esc = max(num_esc, i)
+        
+        for i in range(1, num_esc + 1):
+            val = params.get(f"SIM_GZ_EC_FUNC{i}")
+            if val is not None and int(val) > 0:
+                map_func(int(val), i - 1)
+                
+        for j in range(1, 9):
+            val = params.get(f"SIM_GZ_SV_FUNC{j}")
+            if val is not None and int(val) > 0:
+                map_func(int(val), num_esc + j - 1)
+    elif selected_family == "HIL":
+        for i in range(1, 17):
+            val = params.get(f"HIL_ACT_FUNC{i}")
+            if val is not None and int(val) > 0:
+                map_func(int(val), i - 1)
+    elif selected_family == "PWM":
+        for i in range(1, 9):
+            val = params.get(f"PWM_MAIN_FUNC{i}")
+            if val is not None and int(val) > 0:
+                map_func(int(val), i - 1)
+        for j in range(1, 9):
+            val = params.get(f"PWM_AUX_FUNC{j}")
+            if val is not None and int(val) > 0:
+                map_func(int(val), 8 + j - 1)
+
+    return actuator_map
 
 
 def analyze(path: Path) -> dict:
@@ -174,7 +255,14 @@ def analyze(path: Path) -> dict:
     }
 
     sensor = dataset_frame(ulog, "sensor_combined")
-    actuators = dataset_frame(ulog, "actuator_controls_0")
+    
+    # Try reading actuator_outputs first, fallback to actuator_controls_0
+    actuators = dataset_frame(ulog, "actuator_outputs")
+    is_physical = True
+    if actuators is None:
+        actuators = dataset_frame(ulog, "actuator_controls_0")
+        is_physical = False
+
     gps = dataset_frame(ulog, "vehicle_gps_position")
     local_pos = dataset_frame(ulog, "vehicle_local_position")
     baro = dataset_frame(ulog, "sensor_baro")
@@ -182,6 +270,7 @@ def analyze(path: Path) -> dict:
     ang_vel = dataset_frame(ulog, "vehicle_angular_velocity")
     air_data = dataset_frame(ulog, "vehicle_air_data")
     status = dataset_frame(ulog, "vehicle_status")
+    vtol_status = dataset_frame(ulog, "vtol_vehicle_status")
 
     sections = report["sections"]
     sections["pid"] = pid_offline.analyze_pid(
@@ -189,6 +278,7 @@ def analyze(path: Path) -> dict:
         params=report["initial_params"],
         airframe_class=report["airframe_class"],
         status=status,
+        vtol_status=vtol_status,
     )
     sections["vibration"] = (
         vibration_fft.analyze_vibration(sensor)
@@ -198,10 +288,19 @@ def analyze(path: Path) -> dict:
         vibration=sections["vibration"], sensor=sensor, ang_vel=ang_vel,
         params=report["initial_params"],
     )
-    sections["actuator_saturation"] = (
-        actuator_saturation.analyze_saturation(actuators)
-        if actuators is not None else {"skipped": "actuator_controls_0 not logged"}
-    )
+
+    # Reconstruct actuator map from initial log parameters
+    actuator_map = _discover_actuators_from_params(ulog.initial_parameters, report["airframe_class"])
+
+    if actuators is not None:
+        sections["actuator_saturation"] = actuator_saturation.analyze_saturation(
+            actuators, actuator_map=actuator_map,
+            airframe_class=report["airframe_class"], is_physical=is_physical
+        )
+        if not any(actuator_map.values()):
+            sections["actuator_saturation"]["actuator_discovery_failed"] = True
+    else:
+        sections["actuator_saturation"] = {"skipped": "actuator outputs/controls not logged"}
     sections["ekf_delays"] = ekf_offline.analyze_delays(
         sensor=sensor, gps=gps, local_pos=local_pos,
         current_params=report["initial_params"],

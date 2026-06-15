@@ -32,6 +32,8 @@ MAVSDK_BIN = Path(mavsdk.__file__).parent / "bin"
 datas = [
     (str(ROOT / "frontend" / "dist"), "frontend/dist"),
     (str(ROOT / "resources" / "bin"), "resources/bin"),
+    (str(ROOT / "backend" / "config.yaml"), "backend"),
+    (str(ROOT / "frontend" / "config.yaml"), "frontend"),
     # Frozen modules import as app.* (pathex=backend), so __file__-relative
     # resources must land under app/, NOT backend/app/.
     (str(ROOT / "backend" / "app" / "core" / "safety_registry.json"),

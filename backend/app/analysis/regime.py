@@ -29,6 +29,7 @@ from collections import deque
 from enum import Enum
 
 from ..mavlink.telemetry_hub import HUB
+from ..core import config
 
 
 class Regime(str, Enum):
@@ -38,12 +39,12 @@ class Regime(str, Enum):
 
 
 # MANUAL_CONTROL axes are scaled -1000..1000.
-_VARIANCE_WINDOW_S = 2.0
-_DYNAMIC_VARIANCE = 15_000.0   # sigma ~12% stick — deliberate maneuvering
-_DWELL_S = 0.7                 # debounce before a state change is accepted
-_INFLIGHT_THROTTLE_PCT = 12.0  # VFR_HUD.throttle above this => not idle
-_INFLIGHT_SPEED_M_S = 1.5
-_VFR_STALE_S = 5.0
+_VARIANCE_WINDOW_S = config.REGIME_VARIANCE_WINDOW_S
+_DYNAMIC_VARIANCE = config.REGIME_DYNAMIC_VARIANCE
+_DWELL_S = config.REGIME_DWELL_S
+_INFLIGHT_THROTTLE_PCT = config.REGIME_INFLIGHT_THROTTLE_PCT
+_INFLIGHT_SPEED_M_S = config.REGIME_INFLIGHT_SPEED_M_S
+_VFR_STALE_S = config.REGIME_VFR_STALE_S
 
 
 class RegimeClassifier:

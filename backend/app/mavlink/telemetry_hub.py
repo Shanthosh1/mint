@@ -113,6 +113,11 @@ class TelemetryHub:
         """
         return sorted(self._latest.values(), key=lambda e: e.ts)
 
+    def clear_latest(self) -> None:
+        """Clear cached state snapshots. Typically called on manual disconnect."""
+        self._latest.clear()
+        self._last_seen.clear()
+
     def stats(self) -> dict:
         return {
             "subscribers": len(self._subscribers),

@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Optional
@@ -77,6 +78,7 @@ class TuningMemory:
 
     def __init__(self, path: Path = config.TUNING_HISTORY_PATH) -> None:
         self._path = path
+        self._lock = threading.Lock()
         # (airframe_class, param, direction) -> {outcome: count}
         self._index: dict[tuple[str, str, str], dict[str, int]] = {}
         self._load()
@@ -139,8 +141,9 @@ class TuningMemory:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         # Append-only: a single line write is atomic enough for this size,
         # and the index is updated only after the line is safely on disk.
-        with open(self._path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec) + "\n")
+        with self._lock:
+            with open(self._path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec) + "\n")
         self._index_record(rec)
         log.info("Recorded tuning outcome: %s %s (%s) -> %s",
                  param, direction, airframe_class, outcome)

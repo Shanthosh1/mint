@@ -36,15 +36,16 @@ import numpy as np
 import pandas as pd
 from scipy import signal
 
+from ..core import config
 from .ekf_offline import _resample_uniform
 
 # Gyro broadband HF noise (rms, rad/s, integrated above _HF_BAND_HZ).
-_HF_BAND_HZ = 40.0
-_GYRO_NOISY_RMS = 0.04
-_GYRO_CLEAN_RMS = 0.012
-_ACCEL_NOISY_RMS = 0.5        # m/s^2
-_HARMONIC_TOL = 0.08          # +/-8% counts as an integer harmonic
-_DELAY_RAISE_MS = 8.0         # measured filter lag worth buying back
+_HF_BAND_HZ = config.FILTER_HF_BAND_HZ
+_GYRO_NOISY_RMS = config.FILTER_GYRO_NOISY_RMS
+_GYRO_CLEAN_RMS = config.FILTER_GYRO_CLEAN_RMS
+_ACCEL_NOISY_RMS = config.FILTER_ACCEL_NOISY_RMS
+_HARMONIC_TOL = config.FILTER_HARMONIC_TOL
+_DELAY_RAISE_MS = config.FILTER_DELAY_RAISE_MS
 
 _DEFAULTS = {
     "IMU_GYRO_CUTOFF": 40.0,

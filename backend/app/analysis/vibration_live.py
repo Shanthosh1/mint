@@ -25,13 +25,15 @@ import asyncio
 import time
 
 from ..mavlink.telemetry_hub import HUB
+from ..mavlink.connection import CONNECTION
+from ..core import config
 
-_VIB_WARN = 30.0
-_VIB_CRIT = 60.0
-_CLIP_WINDOW_S = 30.0       # recent clipping blocks tuning this long
-_ALERT_COOLDOWN_S = 30.0
-_STALE_S = 2.0             # VIBRATION gone this long mid-flight => fail safe
-_NEVER_STREAMED_S = 10.0   # never seen this long => assume link doesn't carry it
+_VIB_WARN = config.VIB_WARN
+_VIB_CRIT = config.VIB_CRIT
+_CLIP_WINDOW_S = config.VIB_CLIP_WINDOW_S
+_ALERT_COOLDOWN_S = config.VIB_ALERT_COOLDOWN_S
+_STALE_S = config.VIB_STALE_S
+_NEVER_STREAMED_S = config.VIB_NEVER_STREAMED_S
 
 
 class VibrationGate:
@@ -43,14 +45,20 @@ class VibrationGate:
         self._last_clip_event = 0.0
         self._last_alert: dict[str, float] = {}
         self._task: asyncio.Task | None = None
+        self._last_ok_val = True
+        self._last_cleared_time = 0.0
 
     def start(self) -> None:
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._run(), name="vibration-gate")
+        if not hasattr(self, "_watchdog_task") or self._watchdog_task is None or self._watchdog_task.done():
+            self._watchdog_task = asyncio.create_task(self._missing_vibration_watchdog(), name="vibration-watchdog")
 
     def stop(self) -> None:
         if self._task:
             self._task.cancel()
+        if hasattr(self, "_watchdog_task") and self._watchdog_task:
+            self._watchdog_task.cancel()
 
     # ------------------------------------------------------------------ #
     def ok(self) -> bool:
@@ -68,19 +76,60 @@ class VibrationGate:
         now = time.monotonic()
         age = now - self._last_seen
         if self._ever_seen and age > _STALE_S:
-            return False  # had a feed, lost it — do not vouch for gain raises
-        if not self._ever_seen and age > _NEVER_STREAMED_S:
-            return True   # link never carries VIBRATION — do not block advice
-        worst = max(self._latest.get(k, 0.0) for k in ("x", "y", "z"))
-        recently_clipped = now - self._last_clip_event < _CLIP_WINDOW_S
-        return worst < _VIB_WARN and not recently_clipped
+            current_ok = False
+        elif not self._ever_seen and age > _NEVER_STREAMED_S:
+            current_ok = True
+        else:
+            worst = max(self._latest.get(k, 0.0) for k in ("x", "y", "z"))
+            recently_clipped = now - self._last_clip_event < _CLIP_WINDOW_S
+            current_ok = worst < _VIB_WARN and not recently_clipped
+
+        if current_ok and not self._last_ok_val:
+            self._last_cleared_time = now
+        self._last_ok_val = current_ok
+        return current_ok
+
+    def just_cleared(self) -> bool:
+        """Returns True for 3 seconds after ok() transitions from False to True."""
+        now = time.monotonic()
+        self.ok()
+        return now - self._last_cleared_time < 3.0
 
     # ------------------------------------------------------------------ #
     async def _run(self) -> None:
         async for event in HUB.subscribe():
-            if event.channel != "vibration":
-                continue
-            self._process(event.payload, time.monotonic())
+            if event.channel == "connection":
+                if event.payload.get("connected"):
+                    # Reset state on new connection
+                    self._ever_seen = False
+                    self._last_seen = 0.0
+                    self._latest = {}
+                    if hasattr(self, "_watchdog_task") and self._watchdog_task:
+                        self._watchdog_task.cancel()
+                    self._watchdog_task = asyncio.create_task(self._missing_vibration_watchdog(), name="vibration-watchdog")
+            elif event.channel == "vibration":
+                self._process(event.payload, time.monotonic())
+
+    async def _missing_vibration_watchdog(self) -> None:
+        """Watchdog that fires if vibration data is never received after connection."""
+        try:
+            connect_time = None
+            while True:
+                await asyncio.sleep(1.0)
+                if not CONNECTION.state.connected:
+                    connect_time = None
+                    continue
+                if connect_time is None:
+                    connect_time = time.monotonic()
+                if time.monotonic() - connect_time >= 10.0:
+                    if not self._ever_seen:
+                        HUB.publish("alert", {
+                            "severity": "warning", "source": "vibration",
+                            "text": "Vibration data never received. Gain raises will be allowed without vibration gating."
+                        })
+                    break
+        except asyncio.CancelledError:
+            pass
 
     def _process(self, p: dict, now: float) -> None:
         self._last_seen = now

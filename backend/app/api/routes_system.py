@@ -40,6 +40,13 @@ class RouterStartRequest(BaseModel):
         return self
 
 
+class ActuatorMapConfig(BaseModel):
+    hover_motors: list[int] = Field(default_factory=list)
+    thrust_motors: list[int] = Field(default_factory=list)
+    control_surfaces: list[int] = Field(default_factory=list)
+    tilt_servos: list[int] = Field(default_factory=list)
+
+
 @router.get("/host")
 def host_info() -> dict:
     """OS autodetection + router binary availability."""
@@ -107,6 +114,8 @@ async def vehicle_connect() -> dict:
                 "label": state.airframe.label,
             } if state.airframe else None
         ),
+        "discovery_failed": state.discovery_failed,
+        "actuator_map": state.actuator_map,
     }
 
 
@@ -114,3 +123,29 @@ async def vehicle_connect() -> dict:
 async def vehicle_disconnect() -> dict:
     await CONNECTION.disconnect()
     return {"connected": False}
+
+
+@router.post("/actuator-map")
+async def update_actuator_map(req: ActuatorMapConfig) -> dict:
+    """Explicitly override the vehicle actuator map with manual config from pilot."""
+    CONNECTION.state.actuator_map = {
+        "hover_motors": req.hover_motors,
+        "thrust_motors": req.thrust_motors,
+        "control_surfaces": req.control_surfaces,
+        "tilt_servos": req.tilt_servos,
+    }
+    CONNECTION.state.discovery_failed = False
+    CONNECTION._publish_airframe()
+    return {"success": True, "actuator_map": CONNECTION.state.actuator_map}
+
+
+@router.get("/config/frontend")
+def get_frontend_config() -> dict:
+    """Read frontend/config.yaml and return it as a JSON dict."""
+    import yaml
+    try:
+        with open(config.FRONTEND_CONFIG_PATH, "r") as f:
+            return yaml.safe_load(f) or {}
+    except Exception as e:
+        log.error("Failed to load frontend config.yaml: %s", e)
+        return {}

@@ -17,6 +17,8 @@ Invariants enforced here:
 """
 from __future__ import annotations
 
+import asyncio
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field, asdict
@@ -55,6 +57,10 @@ class Proposal:
     tuning_history: Optional[dict] = None
     # Pilot's verdict once this was written and flown: better/worse/no_change.
     feedback: Optional[str] = None
+    is_saturation_gain_reduction: bool = False
+    confidence: Optional[str] = None
+    limitations: Optional[str] = None
+    written_at: Optional[float] = None
 
 
 class ParamAdvisor:
@@ -62,10 +68,68 @@ class ParamAdvisor:
 
     def __init__(self) -> None:
         self._proposals: dict[str, Proposal] = {}
+        self._diagnostics: dict[str, str] = {}
+        self._lock = threading.Lock()
+        self._timeout_task: Optional[asyncio.Task] = None
+
+    def start(self) -> None:
+        if self._timeout_task is None or self._timeout_task.done():
+            self._timeout_task = asyncio.create_task(self._auto_timeout_loop(), name="advisor-timeout")
+
+    def stop(self) -> None:
+        if self._timeout_task:
+            self._timeout_task.cancel()
+            self._timeout_task = None
+
+    async def _auto_timeout_loop(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(5.0)
+                now = time.time()
+                to_update = []
+                with self._lock:
+                    for p in self._proposals.values():
+                        if p.state == ProposalState.WRITTEN and p.feedback is None:
+                            written_at = getattr(p, "written_at", None)
+                            if written_at is not None and now - written_at > 60.0:
+                                to_update.append(p)
+                for p in to_update:
+                    self.record_feedback(p.id, "no_feedback")
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+
+    def set_diagnostic_card(self, axis: str, text: str) -> None:
+        changed = False
+        with self._lock:
+            if self._diagnostics.get(axis) != text:
+                self._diagnostics[axis] = text
+                changed = True
+        if changed:
+            HUB.publish("proposal", {"refresh": True})
+
+    def clear_diagnostic_card(self, axis: str) -> None:
+        changed = False
+        with self._lock:
+            if axis in self._diagnostics:
+                del self._diagnostics[axis]
+                changed = True
+        if changed:
+            HUB.publish("proposal", {"refresh": True})
+
+    def clear(self) -> None:
+        with self._lock:
+            self._proposals.clear()
+            self._diagnostics.clear()
+
+
 
     # ------------------------------------------------------------------ #
     async def create_proposal(self, param: str, target_value: float,
-                              rationale: str) -> Proposal:
+                              rationale: str, is_saturation_gain_reduction: bool = False,
+                              confidence: Optional[str] = None,
+                              limitations: Optional[str] = None) -> Proposal:
         """Validate analyzer advice and stage it for pilot review."""
         airframe = CONNECTION.state.airframe
         if airframe is None:
@@ -75,6 +139,16 @@ class ParamAdvisor:
             )
 
         current = await CONNECTION.read_param(param)
+
+        if is_saturation_gain_reduction:
+            from ..core import config
+            if not config.EXPERT_MODE:
+                raise PermissionError("Tuning gains is blocked during saturation. Back off rates instead.")
+            if target_value >= current:
+                raise ValueError("Expert mode P-gain modification during saturation must be a reduction.")
+            if target_value < current * 0.85:
+                target_value = round(current * 0.85, 6)
+
         check = REGISTRY.validate_proposal(
             airframe.airframe_class, param, current, target_value
         )
@@ -100,29 +174,20 @@ class ParamAdvisor:
                    else ProposalState.PRESENTED),
             safety_note=check.reason,
             tuning_history=summary.to_dict() if summary else None,
+            is_saturation_gain_reduction=is_saturation_gain_reduction,
+            confidence=confidence,
+            limitations=limitations,
         )
-        self._proposals[prop.id] = prop
+        with self._lock:
+            self._proposals[prop.id] = prop
         HUB.publish("proposal", asdict(prop))
         return prop
 
     # ------------------------------------------------------------------ #
     async def approve_and_write(self, proposal_id: str) -> Proposal:
-        """
-        Pilot pressed "Approve & Write".
-
-        Re-validates against the live on-vehicle value before dispatching —
-        if anything moved (e.g. pilot changed it in QGC meanwhile), the
-        write is blocked and the proposal flips to REJECTED.
-
-        Accepted race: there is a sub-millisecond window between this re-read
-        and the write in which another GCS could change the parameter, so the
-        write would commit against a just-stale validation. This is tolerated
-        rather than fixed — MAVSDK exposes no compare-and-set param API, and
-        the safety registry's per-write `max_step` clamp bounds the worst-case
-        movement regardless, so a lost race can never produce a catastrophic
-        value (only a slightly-off-from-intended one against the new baseline).
-        """
-        prop = self._proposals.get(proposal_id)
+        prop = None
+        with self._lock:
+            prop = self._proposals.get(proposal_id)
         if prop is None:
             raise KeyError(f"Unknown proposal {proposal_id}")
         if prop.state != ProposalState.PRESENTED:
@@ -133,40 +198,44 @@ class ParamAdvisor:
             prop.airframe_class, prop.param, live_current, prop.proposed_value
         )
         if recheck.allowed is None:
-            prop.state = ProposalState.REJECTED
-            prop.safety_note = f"Re-validation failed at write time: {recheck.reason}"
+            with self._lock:
+                prop.state = ProposalState.REJECTED
+                prop.safety_note = f"Re-validation failed at write time: {recheck.reason}"
             HUB.publish("proposal", asdict(prop))
             return prop
 
-        prop.state = ProposalState.APPROVED
+        with self._lock:
+            prop.state = ProposalState.APPROVED
         try:
             await CONNECTION.write_approved_param(
                 prop.param, recheck.allowed,
                 as_int=REGISTRY.is_int(prop.airframe_class, prop.param),
             )
-            prop.proposed_value = recheck.allowed
-            prop.state = ProposalState.WRITTEN
+            with self._lock:
+                prop.proposed_value = recheck.allowed
+                prop.state = ProposalState.WRITTEN
+                prop.written_at = time.time()
+            
+            # If this is a rate auto limit, notify pilot that new flight data is required to verify the fix
+            if prop.param.startswith("MC_") and prop.param.endswith("RAUTO_MAX"):
+                axis = prop.param.split("_")[1].replace("ROLL", "roll").replace("PITCH", "pitch").replace("YAW", "yaw").lower()
+                HUB.publish("pilot_prompt", {
+                    "axis": axis,
+                    "text": f"New flight data required: Please perform dynamic maneuvers on the {axis} axis to verify that saturation is resolved.",
+                    "kind": "step_input_request"
+                })
         except Exception as exc:
-            prop.state = ProposalState.FAILED
-            prop.safety_note = f"Write failed: {exc}"
+            with self._lock:
+                prop.state = ProposalState.FAILED
+                prop.safety_note = f"Write failed: {exc}"
         HUB.publish("proposal", asdict(prop))
         return prop
 
     # ------------------------------------------------------------------ #
     async def revert(self, proposal_id: str) -> Proposal:
-        """Undo a written change: restore the parameter's pre-write value.
-
-        `current_value` is the live on-vehicle value captured at write time,
-        so reverting it rolls back exactly this one change (not any earlier
-        ones). Guarded by the same baseline check as a forward write: if the
-        live value no longer matches what MINT wrote, the parameter was
-        changed by someone else since (engine, pilot, QGC) and the revert is
-        blocked — silently writing the old value back would clobber that
-        newer change. Restoring a value that was live moments ago is itself
-        safe, but the write still goes through the single approved-write path
-        so the invariant ("one writer") and logging hold.
-        """
-        prop = self._proposals.get(proposal_id)
+        prop = None
+        with self._lock:
+            prop = self._proposals.get(proposal_id)
         if prop is None:
             raise KeyError(f"Unknown proposal {proposal_id}")
         if prop.state != ProposalState.WRITTEN:
@@ -176,10 +245,8 @@ class ParamAdvisor:
             )
 
         live = await CONNECTION.read_param(prop.param)
-        # Float params: compare with a relative tolerance so storage rounding
-        # doesn't read as tampering.
         wrote = prop.proposed_value
-        tol = max(1e-6, abs(wrote) * 1e-3)
+        tol = max(1e-4, abs(wrote) * 1e-3)
         if abs(live - wrote) > tol:
             raise ValueError(
                 f"{prop.param} is now {live:g}, not the {wrote:g} MINT wrote — "
@@ -191,51 +258,83 @@ class ParamAdvisor:
             prop.param, prop.current_value,
             as_int=REGISTRY.is_int(prop.airframe_class, prop.param),
         )
-        prop.state = ProposalState.REVERTED
-        prop.safety_note = (
-            f"Reverted {prop.param} from {wrote:g} back to its pre-write "
-            f"value {prop.current_value:g}."
-        )
+        with self._lock:
+            prop.state = ProposalState.REVERTED
+            prop.safety_note = (
+                f"Reverted {prop.param} from {wrote:g} back to its pre-write "
+                f"value {prop.current_value:g}."
+            )
         HUB.publish("proposal", asdict(prop))
         return prop
 
     # ------------------------------------------------------------------ #
     def record_feedback(self, proposal_id: str, outcome: str) -> Proposal:
-        """Pilot's verdict on a written change (better/worse/no_change).
-
-        Only WRITTEN proposals can take feedback — there is no outcome to
-        record for a change that was never applied. The outcome is persisted
-        to the tuning memory keyed by airframe/param/direction so future
-        proposals for the same change can show the track record.
-        """
-        prop = self._proposals.get(proposal_id)
-        if prop is None:
-            raise KeyError(f"Unknown proposal {proposal_id}")
-        if prop.state != ProposalState.WRITTEN:
-            raise ValueError(
-                f"Proposal {proposal_id} is {prop.state}; feedback is only "
-                f"valid once a change has been written."
-            )
-        MEMORY.record_outcome(
-            proposal_id=prop.id,
-            param=prop.param,
-            airframe_class=prop.airframe_class,
-            direction=classify_direction(prop.current_value, prop.proposed_value),
-            current_value=prop.current_value,
-            written_value=prop.proposed_value,
-            outcome=outcome,
-        )
-        prop.feedback = outcome
-        HUB.publish("proposal", asdict(prop))
-        return prop
+        with self._lock:
+            prop = self._proposals.get(proposal_id)
+            if prop is None:
+                raise KeyError(f"Unknown proposal {proposal_id}")
+            if prop.state != ProposalState.WRITTEN:
+                raise ValueError(
+                    f"Proposal {proposal_id} is {prop.state}; feedback is only "
+                    f"valid once a change has been written."
+                )
+            if outcome not in ("skip", "no_feedback"):
+                MEMORY.record_outcome(
+                    proposal_id=prop.id,
+                    param=prop.param,
+                    airframe_class=prop.airframe_class,
+                    direction=classify_direction(prop.current_value, prop.proposed_value),
+                    current_value=prop.current_value,
+                    written_value=prop.proposed_value,
+                    outcome=outcome,
+                )
+            prop.feedback = outcome
+            HUB.publish("proposal", asdict(prop))
+            return prop
 
     # ------------------------------------------------------------------ #
     def dismiss(self, proposal_id: str) -> None:
-        self._proposals.pop(proposal_id, None)
+        with self._lock:
+            self._proposals.pop(proposal_id, None)
 
     def list_proposals(self) -> list[dict]:
-        return [asdict(p) for p in
-                sorted(self._proposals.values(), key=lambda p: -p.created_at)]
+        with self._lock:
+            res = [asdict(p) for p in
+                   sorted(self._proposals.values(), key=lambda p: -p.created_at)]
+            for axis, msg in self._diagnostics.items():
+                has_real_proposal = False
+                # Substring matching on parameter names (e.g. ROLL, PITCH, YAW) is used to detect the axis.
+                # This matches both rate-P gain parameters and rate limit parameters (e.g., MC_ROLLRAUTO_MAX).
+                # This suppression logic prevents showing a diagnostic ("fly steps") if an active proposal already exists for that axis.
+                for p in self._proposals.values():
+                    if p.state in (ProposalState.PRESENTED, ProposalState.WRITTEN):
+                        if axis == "roll" and "ROLL" in p.param:
+                            has_real_proposal = True
+                        elif axis == "pitch" and "PITCH" in p.param:
+                            has_real_proposal = True
+                        elif axis == "yaw" and "YAW" in p.param:
+                            has_real_proposal = True
+                
+                if not has_real_proposal:
+                    res.append({
+                        "id": f"diag_{axis}",
+                        "param": axis.upper(),
+                        "current_value": 0.0,
+                        "proposed_value": 0.0,
+                        "requested_value": 0.0,
+                        "rationale": msg,
+                        "airframe_class": "",
+                        "state": "diagnostic",
+                        "safety_note": "",
+                        "created_at": time.time(),
+                        "tuning_history": None,
+                        "feedback": None,
+                        "is_saturation_gain_reduction": False,
+                        "confidence": None,
+                        "limitations": None,
+                        "written_at": None,
+                    })
+            return res
 
 
 ADVISOR = ParamAdvisor()

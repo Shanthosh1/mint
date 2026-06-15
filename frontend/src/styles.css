@@ -64,7 +64,79 @@ body {
   display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
   padding: 14px clamp(14px, 1.5vw, 24px); margin-bottom: 18px;
 }
+.topbar.stale {
+  border-color: var(--crit);
+  box-shadow: 0 0 12px rgba(248, 113, 113, 0.25);
+}
+.telemetry-stale-banner {
+  background: rgba(248, 113, 113, 0.12);
+  border: 1px solid var(--crit);
+  color: var(--crit);
+  border-radius: var(--radius);
+  padding: 12px 18px;
+  margin-bottom: 18px;
+  text-align: center;
+  font-weight: 600;
+  font-size: 0.85rem;
+  letter-spacing: 0.05em;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+}
 .topbar .logo { font-weight: 700; font-size: 1.15rem; letter-spacing: 0.02em; }
+
+/* ---- topbar navigation --------------------------------------------------- */
+.topbar-nav {
+  display: flex; gap: 4px; margin-left: 12px;
+}
+.nav-link {
+  position: relative;
+  text-decoration: none;
+  color: var(--text-mid);
+  font-size: 0.8rem;
+  font-weight: 500;
+  padding: 6px 14px;
+  border-radius: 8px;
+  transition: all 0.2s ease;
+  cursor: pointer;
+}
+.nav-link:hover {
+  color: var(--text-hi);
+  background: rgba(255, 255, 255, 0.04);
+}
+.nav-link.active {
+  color: var(--accent);
+  font-weight: 600;
+  background: rgba(79, 140, 255, 0.08);
+}
+.nav-link.active::after {
+  content: '';
+  position: absolute;
+  bottom: -1px;
+  left: 14px;
+  right: 14px;
+  height: 2px;
+  background: var(--accent);
+  border-radius: 2px;
+  box-shadow: 0 0 8px var(--accent-glow);
+}
+
+/* ---- post-flight page layout ---------------------------------------------- */
+.postflight-page {
+  max-width: 1100px;
+  margin: 0 auto;
+}
+
+/* ---- page transition ------------------------------------------------------- */
+.animate-fade {
+  animation: page-fade 0.3s ease;
+}
+@keyframes page-fade {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
 .topbar .logo span { color: var(--accent); }
 .grid {
   display: grid; gap: clamp(12px, 1.2vw, 20px);
@@ -75,6 +147,16 @@ body {
   align-items: start;
 }
 .col { display: flex; flex-direction: column; gap: clamp(12px, 1.2vw, 20px); min-width: 0; }
+.row-panels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: clamp(12px, 1.2vw, 20px);
+  width: 100%;
+}
+.row-panels > * {
+  flex: 1 1 250px;
+  min-width: 0;
+}
 /* Mid-size screens: charts keep the full row, side panels pair up below. */
 @media (max-width: 1280px) {
   .grid { grid-template-columns: 1fr 1fr; }
@@ -140,6 +222,7 @@ select, input[type="text"] {
 .gauge-fill.ok   { background: linear-gradient(90deg, #10b981, #34d399); }
 .gauge-fill.warn { background: linear-gradient(90deg, #d97706, #fbbf24); }
 .gauge-fill.crit { background: linear-gradient(90deg, #dc2626, #f87171); box-shadow: 0 0 12px var(--crit); }
+.gauge-fill.unknown { background: var(--text-lo); opacity: 0.4; }
 .gauge-gate { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--crit); opacity: 0.7; }
 
 /* ---- alerts / prompts ------------------------------------------------------ */
@@ -149,6 +232,7 @@ select, input[type="text"] {
   animation: slide-in 0.25s ease;
 }
 .alert.info     { border-color: rgba(79,140,255,0.4);  background: rgba(79,140,255,0.08); }
+.alert.success  { border-color: rgba(34,197,94,0.4);   background: rgba(34,197,94,0.08); }
 .alert.warning  { border-color: rgba(251,191,36,0.4);  background: rgba(251,191,36,0.08); }
 .alert.critical { border-color: rgba(248,113,113,0.5); background: rgba(248,113,113,0.10); }
 .pilot-prompt {
@@ -170,6 +254,21 @@ select, input[type="text"] {
 .uplot { font-family: 'Inter', sans-serif !important; }
 .u-legend { color: var(--text-mid) !important; font-size: 0.75rem !important; }
 .u-axis { color: var(--text-lo); }
+.u-select { background: rgba(79, 140, 255, 0.12) !important; }
+
+/* ---- zoom reset button ---------------------------------------------------------- */
+.zoom-reset-btn {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  z-index: 10;
+  font-size: 0.7rem;
+  padding: 4px 10px;
+  border-radius: 8px;
+  opacity: 0.85;
+  animation: page-fade 0.2s ease;
+}
+.zoom-reset-btn:hover { opacity: 1; }
 
 /* ---- upload drop zone ----------------------------------------------------------- */
 .dropzone {
@@ -266,5 +365,64 @@ select, input[type="text"] {
 }
 .insight-content {
   flex-grow: 1;
+}
+
+/* Scrollable container for panels */
+.scrollable-stack {
+  max-height: 480px;
+  overflow-y: auto;
+  padding-right: 6px;
+}
+.scrollable-stack::-webkit-scrollbar {
+  width: 6px;
+}
+.scrollable-stack::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.1);
+  border-radius: 3px;
+}
+.scrollable-stack::-webkit-scrollbar-thumb {
+  background: var(--glass-strong);
+  border-radius: 3px;
+}
+.scrollable-stack::-webkit-scrollbar-thumb:hover {
+  background: var(--accent);
+}
+
+/* Diagnostic cards rendering style */
+.card.diagnostic {
+  opacity: 0.65;
+  border-left: 3px solid var(--accent);
+}
+
+/* ---- responsive topbar --------------------------------------------------- */
+.topbar-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+@media (max-width: 850px) {
+  .topbar {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 12px;
+    padding: 18px;
+  }
+  .topbar-nav {
+    margin-left: 0;
+    justify-content: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .topbar .logo {
+    text-align: center;
+  }
+  .topbar-spacer {
+    display: none;
+  }
+  .topbar-status {
+    justify-content: center;
+  }
 }
 

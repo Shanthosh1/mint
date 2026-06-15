@@ -18,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from app.advisors.param_advisor import ADVISOR
 from app.analysis.cascade import CASCADE
 from app.analysis.domains import ACTUATION
 from app.analysis.ekf_monitor import EKF_MONITOR
@@ -51,6 +52,7 @@ async def lifespan(app: FastAPI):
     VTOL_MONITOR.start()
     CASCADE.start()
     VIB_GATE.start()
+    ADVISOR.start()
     log.info("Analysis engines online. UI at http://%s:%s", config.HTTP_HOST, config.HTTP_PORT)
     yield
     # Orderly teardown: vehicle link first, then the router subprocess.
@@ -63,6 +65,7 @@ async def lifespan(app: FastAPI):
     VTOL_MONITOR.stop()
     CASCADE.stop()
     VIB_GATE.stop()
+    ADVISOR.stop()
 
 
 def create_app() -> FastAPI:

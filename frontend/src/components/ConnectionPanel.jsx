@@ -19,6 +19,85 @@ const MODE_HINTS = {
   tcp_connect: 'TCP client — serial-over-ethernet bridges, ArduPilot SITL (port 5760).',
 };
 
+function ActuatorManualMapper({ onSave }) {
+  const [map, setMap] = useState({
+    1: 'none', 2: 'none', 3: 'none', 4: 'none',
+    5: 'none', 6: 'none', 7: 'none', 8: 'none',
+    9: 'none', 10: 'none', 11: 'none', 12: 'none',
+    13: 'none', 14: 'none', 15: 'none', 16: 'none',
+  });
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  const apply = async () => {
+    setBusy(true); setErr(null);
+    try {
+      const hover_motors = [];
+      const thrust_motors = [];
+      const control_surfaces = [];
+      const tilt_servos = [];
+
+      for (let ch = 1; ch <= 16; ch++) {
+        const role = map[ch];
+        const idx = ch - 1;
+        if (role === 'hover') hover_motors.push(idx);
+        else if (role === 'thrust') thrust_motors.push(idx);
+        else if (role === 'surface') control_surfaces.push(idx);
+        else if (role === 'tilt') tilt_servos.push(idx);
+      }
+
+      await api.updateActuatorMap({
+        hover_motors,
+        thrust_motors,
+        control_surfaces,
+        tilt_servos
+      });
+      if (onSave) onSave();
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="alert warning stack" style={{ marginTop: 12, padding: 12, gap: 10, background: 'rgba(255, 165, 0, 0.08)', border: '1px solid rgba(255, 165, 0, 0.3)' }}>
+      <div style={{ fontWeight: 600, fontSize: '0.82rem', display: 'flex', alignItems: 'center', gap: 6 }}>
+        <span>⚠</span> Actuator Auto-Discovery Failed
+      </div>
+      <div className="muted" style={{ fontSize: '0.72rem', lineHeight: '1.25' }}>
+        Could not detect actuator assignments automatically. Assign physical outputs manually to continue:
+      </div>
+      
+      <div className="scrollable-stack" style={{ maxHeight: 180, overflowY: 'auto', paddingRight: 4, display: 'flex', flexDirection: 'column', gap: 4 }}>
+        {Array.from({ length: 16 }, (_, i) => i + 1).map((ch) => (
+          <div key={ch} className="row spread" style={{ fontSize: '0.74rem', padding: '2px 0', alignItems: 'center' }}>
+            <span className="mono">Channel {ch}</span>
+            <select
+              value={map[ch]}
+              onChange={(e) => setMap({ ...map, [ch]: e.target.value })}
+              style={{ padding: '2px 6px', fontSize: '0.72rem', width: 140, background: 'rgba(0,0,0,0.2)', color: 'var(--text-main)', border: '1px solid var(--glass-border)', borderRadius: 4 }}
+            >
+              <option value="none">None / Unmapped</option>
+              <option value="hover">Hover Motor (M)</option>
+              <option value="thrust">Thrust Motor (P)</option>
+              <option value="surface">Control Surface (S)</option>
+              <option value="tilt">Tilt Servo (Tilt)</option>
+            </select>
+          </div>
+        ))}
+      </div>
+
+      {err && <div className="alert critical" style={{ fontSize: '0.72rem', padding: '4px 8px', marginTop: 4 }}>{err}</div>}
+      
+      <button className="btn primary" disabled={busy} onClick={apply} style={{ fontSize: '0.72rem', padding: '6px 10px', marginTop: 4 }}>
+        {busy ? 'Applying...' : 'Apply Actuator Mapping'}
+      </button>
+    </div>
+  );
+}
+
+
 /**
  * MAVLink source picker (serial / UDP / TCP) + mavp2p router toggle +
  * vehicle connect. Surfaces OS info, permission problems, and the
@@ -187,6 +266,8 @@ export default function ConnectionPanel() {
             {airframe.label} ({airframe.airframe_class}) · SYS_AUTOSTART {airframe.sys_autostart}
           </div>
         )}
+
+        {airframe?.discovery_failed && <ActuatorManualMapper onSave={refresh} />}
 
         {error && <div className="alert critical">{error}</div>}
       </div>

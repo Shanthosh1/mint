@@ -28,6 +28,9 @@ class ProposalRequest(BaseModel):
     scale_factor: float | None = Field(None, gt=0, le=3.0)
     delta: float | None = None
     rationale: str = Field(default="Manually requested by pilot")
+    is_saturation_gain_reduction: bool = False
+    confidence: str | None = None
+    limitations: str | None = None
 
     @model_validator(mode="after")
     def _exactly_one_form(self):
@@ -39,10 +42,11 @@ class ProposalRequest(BaseModel):
 
 class TuningWindowRequest(BaseModel):
     axis: str = Field(..., pattern="^(roll|pitch|yaw)$")
+    loop: str = Field(..., pattern="^(rate|attitude|velocity|position)$")
 
 
 class FeedbackRequest(BaseModel):
-    outcome: str = Field(..., pattern="^(better|worse|no_change)$",
+    outcome: str = Field(..., pattern="^(better|worse|no_change|skip|no_feedback)$",
                          examples=["better"])
 
 
@@ -67,7 +71,12 @@ async def create_proposal(req: ProposalRequest) -> dict:
             current = await CONNECTION.read_param(req.param)
             target = (current * req.scale_factor if req.scale_factor is not None
                       else current + req.delta)
-        prop = await ADVISOR.create_proposal(req.param, round(target, 6), req.rationale)
+        prop = await ADVISOR.create_proposal(
+            req.param, round(target, 6), req.rationale,
+            is_saturation_gain_reduction=req.is_saturation_gain_reduction,
+            confidence=req.confidence,
+            limitations=req.limitations
+        )
     except PermissionError as exc:
         raise HTTPException(409, str(exc))
     except ConnectionError as exc:
@@ -149,7 +158,7 @@ async def read_param(name: str) -> dict:
 @router.post("/tuning-window/start")
 def start_tuning_window(req: TuningWindowRequest) -> dict:
     """Open a dynamic-testing window; the stick monitor begins watching."""
-    STICK_MONITOR.begin_window(req.axis)
+    STICK_MONITOR.begin_window(req.axis, req.loop)
     return {"tuning_axis": req.axis}
 
 

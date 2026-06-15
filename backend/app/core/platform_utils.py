@@ -117,7 +117,9 @@ def scan_serial_ports() -> list[SerialPortInfo]:
 
 
 def host_info_dict() -> dict:
-    return asdict(detect_host())
+    res = asdict(detect_host())
+    res["expert_mode"] = config.EXPERT_MODE
+    return res
 
 
 def serial_ports_dict() -> list[dict]:

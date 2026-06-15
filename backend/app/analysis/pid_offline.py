@@ -43,12 +43,12 @@ _SP_COLS = {"roll": "roll", "pitch": "pitch", "yaw": "yaw"}
 _ACT_COLS = {"roll": "xyz[0]", "pitch": "xyz[1]", "yaw": "xyz[2]"}
 _GYRO_COLS = {"roll": "gyro_rad[0]", "pitch": "gyro_rad[1]", "yaw": "gyro_rad[2]"}
 
-# Axis -> rate parameter (P for MC, FF for FW), per safety class.
+# Axis -> rate parameter (P for MC, P for FW), per safety class.
 _RATE_P_PARAM = {
     "MULTIROTOR": {"roll": "MC_ROLLRATE_P", "pitch": "MC_PITCHRATE_P", "yaw": "MC_YAWRATE_P"},
     "VTOL": {"roll": "MC_ROLLRATE_P", "pitch": "MC_PITCHRATE_P", "yaw": None},
-    "FIXED_WING": {"roll": "FW_RR_FF", "pitch": "FW_PR_FF", "yaw": "FW_YR_FF"},
-    "DELTA_WING": {"roll": "FW_RR_FF", "pitch": "FW_PR_FF", "yaw": None},
+    "FIXED_WING": {"roll": "FW_RR_P", "pitch": "FW_PR_P", "yaw": "FW_YR_P"},
+    "DELTA_WING": {"roll": "FW_RR_P", "pitch": "FW_PR_P", "yaw": None},
 }
 
 
@@ -155,7 +155,8 @@ def _suggest(axis: str, stats: dict, airframe_class: str | None,
         return recs, notes
 
     is_ff = "FF" in param
-    damping_note = "" if is_ff else " (or raise rate D)"
+    is_fw_yaw = (airframe_class in ("FIXED_WING", "DELTA_WING") and axis == "yaw")
+    damping_note = "" if (is_ff or is_fw_yaw) else " (or raise rate D)"
 
     if overshoot > _OVERSHOOT_LIMIT:
         recs.append({
@@ -187,7 +188,8 @@ def analyze_pid(rates_sp: pd.DataFrame | None,
                 sensor: pd.DataFrame | None,
                 params: dict,
                 airframe_class: str | None,
-                status: pd.DataFrame | None = None) -> dict:
+                status: pd.DataFrame | None = None,
+                vtol_status: pd.DataFrame | None = None) -> dict:
     """Full-log rate-tracking analysis. Returns per-axis stats + proposals."""
     if rates_sp is None:
         return {"skipped": "vehicle_rates_setpoint not logged — enable a "
@@ -229,12 +231,25 @@ def analyze_pid(rates_sp: pd.DataFrame | None,
             vtype = status["vehicle_type"].to_numpy(np.float64)
             if len(t_status) > 0:
                 grid_vtype = np.round(np.interp(grid, t_status, vtype))
+        elif vtol_status is not None and "vtol_in_rw_mode" in vtol_status.columns:
+            t_vtol = vtol_status["timestamp"].to_numpy(np.float64) / 1e6
+            rw_mode = vtol_status["vtol_in_rw_mode"].to_numpy(np.float64)
+            if len(t_vtol) > 0:
+                # rw_mode is True (1) in hover/MC, False (0) in forward-flight/FW
+                vtype = np.where(rw_mode > 0.5, 1.0, 2.0)
+                grid_vtype = np.round(np.interp(grid, t_vtol, vtype))
 
         if airframe_class == "VTOL":
             # VTOL splits into Rotary-wing (1) and Fixed-wing (2)
-            mc_mask = (grid_vtype == 1) if grid_vtype is not None else None
+            if grid_vtype is None:
+                notes.append("VTOL split failed (no vehicle_status or vtol_vehicle_status data). Treating all steps as MC-only.")
+                mc_mask = None
+                fw_mask = np.zeros_like(grid, dtype=bool)
+            else:
+                mc_mask = (grid_vtype == 1)
+                fw_mask = (grid_vtype == 2)
+
             mc_stats = _analyze_axis(grid, sp, act, mc_mask)
-            fw_mask = (grid_vtype == 2) if grid_vtype is not None else None
             fw_stats = _analyze_axis(grid, sp, act, fw_mask)
 
             axes[axis] = {

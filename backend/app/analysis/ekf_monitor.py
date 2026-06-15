@@ -31,6 +31,7 @@ import asyncio
 import time
 
 from ..core import config
+from ..mavlink.connection import CONNECTION
 from ..mavlink.telemetry_hub import HUB
 from .recommendations import recommend
 from .regime import REGIME, Regime
@@ -97,22 +98,57 @@ class EkfMonitor:
                         "text": "EKF status reports resumed — gauges live again.",
                     })
                 self._process(event.payload)
+            elif event.channel == "estimator_status":
+                if self._stale:
+                    # Data resumed — clear the UNKNOWN state.
+                    self._stale = False
+                    HUB.publish("alert", {
+                        "severity": "info", "source": "ekf",
+                        "text": "EKF status reports resumed — gauges live again.",
+                    })
+                self._process_estimator_status(event.payload)
 
     async def _staleness_loop(self) -> None:
         """Flag a dead EKF feed so the gauges show UNKNOWN, not stale green.
 
-        EKF_STATUS_REPORT can stop while attitude still streams (so the
+        EKF_STATUS_REPORT or ESTIMATOR_STATUS can stop while attitude still streams (so the
         generic telemetry watchdog won't catch it). Once EKF data has been
         seen at least once, a gap longer than the threshold publishes an
         UNKNOWN metrics state plus a one-shot alert.
         """
+        start_time = None
+        has_alerted_missing = False
         try:
             while True:
                 await asyncio.sleep(_STALE_CHECK_S)
-                seen = HUB.last_seen("ekf_status")
+                if not CONNECTION.state.connected:
+                    start_time = None
+                    has_alerted_missing = False
+                    self._stale = False
+                    continue
+                if start_time is None:
+                    start_time = time.monotonic()
+                seen_ekf = HUB.last_seen("ekf_status")
+                seen_est = HUB.last_seen("estimator_status")
+                seen = None
+                if seen_ekf is not None and seen_est is not None:
+                    seen = max(seen_ekf, seen_est)
+                elif seen_ekf is not None:
+                    seen = seen_ekf
+                elif seen_est is not None:
+                    seen = seen_est
+
                 if seen is None:
+                    if not has_alerted_missing and (time.monotonic() - start_time > 5.0):
+                        has_alerted_missing = True
+                        HUB.publish("alert", {
+                            "severity": "critical", "source": "ekf",
+                            "text": "No EKF data received within 5 seconds of connection. Check PX4 configuration."
+                        })
                     continue  # never started — nothing to call stale yet
-                if HUB.is_stale("ekf_status", _STALE_MAX_AGE_S):
+                
+                active_channel = "ekf_status" if seen_ekf is not None and (seen_est is None or seen_ekf > seen_est) else "estimator_status"
+                if HUB.is_stale(active_channel, _STALE_MAX_AGE_S):
                     if not self._stale:
                         self._stale = True
                         HUB.publish("ekf_metrics", {
@@ -141,14 +177,7 @@ class EkfMonitor:
                 and now - self._runup_started <= _RUNUP_WINDOW_S)
 
     # ------------------------------------------------------------------ #
-    def _process(self, report: dict) -> None:
-        now = time.monotonic()
-        ratios = {
-            label: round(float(report.get(field, 0.0) or 0.0), 3)
-            for field, label in _RATIO_FIELDS.items()
-        }
-        flags = int(report.get("flags", 0) or 0)
-
+    def _handle_ratios_and_flags(self, ratios: dict[str, float], flags: int, now: float) -> None:
         HUB.publish("ekf_metrics", {
             "ratios": ratios, "flags": flags, "regime": REGIME.current.value,
             "status": "ok",
@@ -174,6 +203,26 @@ class EkfMonitor:
                 "source": "ekf",
                 "text": self._alert_text(label, ratio, severity),
             })
+
+    def _process(self, report: dict) -> None:
+        now = time.monotonic()
+        ratios = {
+            label: round(float(report.get(field, 0.0) or 0.0), 3)
+            for field, label in _RATIO_FIELDS.items()
+        }
+        flags = int(report.get("flags", 0) or 0)
+        self._handle_ratios_and_flags(ratios, flags, now)
+
+    def _process_estimator_status(self, report: dict) -> None:
+        now = time.monotonic()
+        ratios = {
+            "gps_velocity": round(float(report.get("vel_ratio", 0.0) or 0.0), 3),
+            "gps_position": round(float(report.get("pos_horiz_ratio", 0.0) or 0.0), 3),
+            "magnetometer": round(float(report.get("mag_ratio", 0.0) or 0.0), 3),
+            "barometer": round(float(report.get("pos_vert_ratio", 0.0) or 0.0), 3),
+        }
+        flags = int(report.get("flags", 0) or 0)
+        self._handle_ratios_and_flags(ratios, flags, now)
 
     # ------------------------------------------------------------------ #
     # Pattern 1: mag interference during throttle run-up

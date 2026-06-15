@@ -27,18 +27,17 @@ from .recommendations import recommend
 from .regime import REGIME, Regime
 
 # Rail-pinning detection (fixed-wing manual scaling).
-_RAIL_THRESHOLD = 950          # |stick| >= this counts as pinned
-_RAIL_WINDOW_S = 30.0
-_RAIL_FRACTION = 0.2           # pinned this share of a dynamic window
-_RAIL_MIN_SAMPLES = 50
+_RAIL_THRESHOLD = config.STICK_RAIL_THRESHOLD
+_RAIL_WINDOW_S = config.STICK_RAIL_WINDOW_S
+_RAIL_FRACTION = config.STICK_RAIL_FRACTION
+_RAIL_MIN_SAMPLES = config.STICK_RAIL_MIN_SAMPLES
 _RAIL_PARAM = {"roll": "FW_MAN_R_SC", "pitch": "FW_MAN_P_SC"}
 _RAIL_FIELD = {"roll": "y", "pitch": "x"}
 
 # MANUAL_CONTROL fields are scaled -1000..1000 by convention.
-_VARIANCE_FLOOR = 25.0          # below this the sticks are "idle"
-_COMPLIANCE_PEAK = 400.0        # a real step input swings at least this far
-_COMPLIANCE_REVERSALS = 3       # "three sharp, alternating inputs"
-
+_VARIANCE_FLOOR = config.STICK_VARIANCE_FLOOR
+_COMPLIANCE_PEAK = config.STICK_COMPLIANCE_PEAK
+_COMPLIANCE_REVERSALS = config.STICK_COMPLIANCE_REVERSALS
 _AXIS_FIELDS = {"roll": "y", "pitch": "x", "yaw": "r"}
 
 _PROMPTS = {
@@ -58,22 +57,25 @@ class StickMonitor:
         self._history: deque[tuple[float, dict[str, float]]] = deque(maxlen=400)
         self._tuning_active = False
         self._needed_axis: Optional[str] = None
+        self._needed_loop: Optional[str] = None
         self._prompt_issued_at: Optional[float] = None
         # rail-pinning: per-axis (t, pinned) over a long rolling window
         self._rail: dict[str, deque] = {"roll": deque(), "pitch": deque()}
         self._task: asyncio.Task | None = None
 
     # -- session control (driven by the API layer) -----------------------
-    def begin_window(self, axis: str) -> None:
-        """Open a dynamic-testing window that needs data on `axis`."""
+    def begin_window(self, axis: str, loop: str) -> None:
+        """Open a dynamic-testing window that needs data on `axis` and `loop`."""
         self._tuning_active = True
         self._needed_axis = axis
+        self._needed_loop = loop
         self._prompt_issued_at = None
         self._history.clear()
 
     def end_window(self) -> None:
         self._tuning_active = False
         self._needed_axis = None
+        self._needed_loop = None
         self._prompt_issued_at = None
 
     def start(self) -> None:

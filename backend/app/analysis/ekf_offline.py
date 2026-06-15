@@ -18,9 +18,11 @@ import numpy as np
 import pandas as pd
 from scipy import signal
 
-_MAX_LAG_S = 0.5            # search window for GPS delay
-_HOVER_MIN_S = 5.0          # minimum quiet segment length
-_HOVER_GYRO_RMS = 0.06      # rad/s — below this we call it "flat hover"
+from ..core import config
+
+_MAX_LAG_S = config.EKF_OFFLINE_MAX_LAG_S
+_HOVER_MIN_S = config.EKF_OFFLINE_HOVER_MIN_S
+_HOVER_GYRO_RMS = config.EKF_OFFLINE_HOVER_GYRO_RMS
 
 
 def _resample_uniform(t_us: np.ndarray, x: np.ndarray, fs: float

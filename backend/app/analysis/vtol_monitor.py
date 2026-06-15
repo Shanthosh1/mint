@@ -33,17 +33,18 @@ from collections import deque
 from ..mavlink.connection import CONNECTION
 from ..mavlink.telemetry_hub import HUB
 from .recommendations import recommend
+from ..core import config
 
 _TRANS_TO_FW, _TRANS_TO_MC, _STATE_MC, _STATE_FW = 1, 2, 3, 4
 
-_STUCK_AFTER_S = 8.0
-_STUCK_ALT_LOSS_M = 3.0
-_DIP_WATCH_S = 3.0
-_DIP_PITCH_RAD = math.radians(-10.0)
-_DIP_ALT_LOSS_M = 2.0
-_HOVER_AIRSPEED_MAX = 4.0
-_ELEVON_FIGHT_STD = 0.25      # normalized deflection std over the window
-_ALERT_COOLDOWN_S = 30.0
+_STUCK_AFTER_S = config.VTOL_STUCK_AFTER_S
+_STUCK_ALT_LOSS_M = config.VTOL_STUCK_ALT_LOSS_M
+_DIP_WATCH_S = config.VTOL_DIP_WATCH_S
+_DIP_PITCH_RAD = math.radians(config.VTOL_DIP_PITCH_DEG)
+_DIP_ALT_LOSS_M = config.VTOL_DIP_ALT_LOSS_M
+_HOVER_AIRSPEED_MAX = config.VTOL_HOVER_AIRSPEED_MAX
+_ELEVON_FIGHT_STD = config.VTOL_ELEVON_FIGHT_STD
+_ALERT_COOLDOWN_S = config.VTOL_ALERT_COOLDOWN_S
 
 
 class VtolMonitor:

@@ -29,6 +29,25 @@ _PASSTHROUGH = {
 }
 
 
+import math
+
+def sanitize_nan(val):
+    if isinstance(val, dict):
+        return {k: sanitize_nan(v) for k, v in val.items()}
+    elif isinstance(val, list):
+        return [sanitize_nan(v) for v in val]
+    elif isinstance(val, float):
+        if math.isnan(val) or math.isinf(val):
+            return None
+    else:
+        try:
+            if math.isnan(val) or math.isinf(val):
+                return None
+        except TypeError:
+            pass
+    return val
+
+
 @router.websocket("/ws/telemetry")
 async def telemetry_socket(ws: WebSocket) -> None:
     await ws.accept()
@@ -42,7 +61,7 @@ async def telemetry_socket(ws: WebSocket) -> None:
                 "ch": event.channel,
                 "t": event.ts,
                 "ts": event.ts_epoch,
-                "d": event.payload,
+                "d": sanitize_nan(event.payload),
                 "replay": True,
             }))
         async for event in HUB.subscribe():
@@ -52,7 +71,7 @@ async def telemetry_socket(ws: WebSocket) -> None:
                 "ch": event.channel,
                 "t": event.ts,
                 "ts": event.ts_epoch,
-                "d": event.payload,
+                "d": sanitize_nan(event.payload),
             }))
     except WebSocketDisconnect:
         log.info("WS client disconnected: %s", ws.client)

@@ -34,7 +34,10 @@
     "EKF2_BARO_DELAY":  { "max_step": 20.0, "abs_min": 0.0, "abs_max": 250.0 },
     "EKF2_MAG_NOISE":   { "max_step": 0.02, "abs_min": 0.001, "abs_max": 1.0 },
     "EKF2_ACC_NOISE":   { "max_step": 0.1,  "abs_min": 0.01, "abs_max": 1.0 },
-    "EKF2_GYR_NOISE":   { "max_step": 0.005, "abs_min": 0.0001, "abs_max": 0.1 }
+    "EKF2_GYR_NOISE":   { "max_step": 0.005, "abs_min": 0.0001, "abs_max": 0.1 },
+    "MC_ROLLRAUTO_MAX":  { "max_step": 30.0, "abs_min": 10.0, "abs_max": 200.0 },
+    "MC_PITCHRAUTO_MAX": { "max_step": 30.0, "abs_min": 10.0, "abs_max": 200.0 },
+    "MC_YAWRAUTO_MAX":   { "max_step": 30.0, "abs_min": 10.0, "abs_max": 200.0 }
   },
   "FIXED_WING": {
     "FW_RR_FF": { "max_step": 0.05, "abs_min": 0.0,   "abs_max": 2.0 },
@@ -107,6 +110,9 @@
     "EKF2_GPS_DELAY":   { "max_step": 50.0, "abs_min": 0.0, "abs_max": 300.0 },
     "EKF2_BARO_DELAY":  { "max_step": 20.0, "abs_min": 0.0, "abs_max": 250.0 },
     "EKF2_MAG_NOISE":   { "max_step": 0.02, "abs_min": 0.001, "abs_max": 1.0 },
-    "EKF2_ACC_NOISE":   { "max_step": 0.1,  "abs_min": 0.01, "abs_max": 1.0 }
+    "EKF2_ACC_NOISE":   { "max_step": 0.1,  "abs_min": 0.01, "abs_max": 1.0 },
+    "MC_ROLLRAUTO_MAX":  { "max_step": 30.0, "abs_min": 10.0, "abs_max": 200.0 },
+    "MC_PITCHRAUTO_MAX": { "max_step": 30.0, "abs_min": 10.0, "abs_max": 200.0 },
+    "MC_YAWRAUTO_MAX":   { "max_step": 30.0, "abs_min": 10.0, "abs_max": 200.0 }
   }
 }

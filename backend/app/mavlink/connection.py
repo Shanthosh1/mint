@@ -18,10 +18,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from mavsdk import System
+from mavsdk.param import ParamError
+from grpc import RpcError
 from pymavlink import mavutil
 
 from ..core import config
@@ -40,6 +42,7 @@ class UnsupportedVehicleError(Exception):
     Covers a non-PX4 autopilot, a PX4 firmware older than the supported
     floor, or an out-of-scope airframe (rover/boat/sub/balloon)."""
 
+
 # Raw messages the analyzer thread forwards into the hub.
 _WATCHED_MESSAGES = {
     "ATTITUDE": "attitude",
@@ -50,6 +53,7 @@ _WATCHED_MESSAGES = {
     "VFR_HUD": "vfr_hud",
     "SYS_STATUS": "sys_status",
     "SERVO_OUTPUT_RAW": "servo_output",   # actuation monitor (domains.py)
+    "ACTUATOR_OUTPUT_STATUS": "actuator_output_status", # dynamic actuation monitor
     "VIBRATION": "vibration",             # live vibration fields
     "EXTENDED_SYS_STATE": "extended_sys_state",  # VTOL transition state
     "LOCAL_POSITION_NED": "local_position",       # velocity/position loops
@@ -59,12 +63,12 @@ _WATCHED_MESSAGES = {
 _MAV_TYPE_GCS = 6  # ignore heartbeats from other ground stations on the link
 
 # Telemetry staleness watchdog.
-_WATCHDOG_PERIOD_S = 1.0    # how often to re-check the firehose
-_STALE_MAX_AGE_S = 2.0      # channel silent longer than this => stale
+_WATCHDOG_PERIOD_S = config.CONN_WATCHDOG_PERIOD_S    # how often to re-check the firehose
+_STALE_MAX_AGE_S = config.CONN_STALE_MAX_AGE_S      # channel silent longer than this => stale
 
 # Control-plane param read retry (transient MAVSDK timeouts in flight).
-_PARAM_READ_ATTEMPTS = 3
-_PARAM_RETRY_BASE_S = 0.25  # doubled each retry: 0.25s, 0.5s
+_PARAM_READ_ATTEMPTS = config.CONN_PARAM_READ_ATTEMPTS
+_PARAM_RETRY_BASE_S = config.CONN_PARAM_RETRY_BASE_S  # doubled each retry: 0.25s, 0.5s
 
 
 @dataclass
@@ -73,6 +77,14 @@ class VehicleState:
     airframe: Optional[AirframeInfo] = None
     system_id: Optional[int] = None
     fw_version: Optional[str] = None     # "1.14.0" once read from MAVSDK Info
+    discovery_failed: bool = False
+    actuator_map: dict[str, list[int]] = field(default_factory=lambda: {
+        "hover_motors": [],
+        "thrust_motors": [],
+        "control_surfaces": [],
+        "tilt_servos": []
+    })
+    actuator_limits: dict[int, dict[str, float]] = field(default_factory=dict)
 
 
 class ConnectionManager:
@@ -117,6 +129,7 @@ class ConnectionManager:
         try:
             await self._verify_supported_firmware()
             await self._detect_airframe()
+            await self._discover_actuators()
         except (UnsupportedVehicleError, UnsupportedAirframeError) as exc:
             self._system = None
             self.state = VehicleState()
@@ -197,7 +210,14 @@ class ConnectionManager:
             self._pymav_thread = None
         self._system = None
         self.state = VehicleState()
+
+        # Clear proposals and cached telemetry
+        from ..advisors.param_advisor import ADVISOR
+        ADVISOR.clear()
+        HUB.clear_latest()
+
         HUB.publish("connection", {"connected": False})
+        HUB.publish("proposal", {"clear": True})
 
     # ------------------------------------------------------------------ #
     # Telemetry staleness watchdog
@@ -218,11 +238,9 @@ class ConnectionManager:
                 await asyncio.sleep(_WATCHDOG_PERIOD_S)
                 # Only meaningful once data has started: require at least one
                 # sample on a channel before judging it stale.
-                stale = [c for c in watched
-                         if HUB.last_seen(c) is not None
-                         and HUB.is_stale(c, _STALE_MAX_AGE_S)]
-                any_data = any(HUB.last_seen(c) is not None for c in watched)
-                now_stale = any_data and bool(stale)
+                seen_channels = [c for c in watched if HUB.last_seen(c) is not None]
+                stale = [c for c in seen_channels if HUB.is_stale(c, _STALE_MAX_AGE_S)]
+                now_stale = len(seen_channels) > 0 and len(stale) == len(seen_channels)
                 if now_stale != was_stale:
                     was_stale = now_stale
                     HUB.publish("telemetry_stale", {
@@ -301,12 +319,301 @@ class ConnectionManager:
     def _publish_airframe(self) -> None:
         af = self.state.airframe
         HUB.publish("airframe", {
-            "sys_autostart": af.sys_autostart,
-            "airframe_class": af.airframe_class,
-            "label": af.label,
-            "mav_type": af.mav_type,
-            "source": af.source,
+            "sys_autostart": af.sys_autostart if af else None,
+            "airframe_class": af.airframe_class if af else None,
+            "label": af.label if af else None,
+            "mav_type": af.mav_type if af else None,
+            "source": af.source if af else None,
+            "discovery_failed": self.state.discovery_failed,
+            "actuator_map": self.state.actuator_map,
         })
+
+    async def _discover_actuators(self) -> None:
+        """Query parameters at connection to build the dynamic actuator lookup table."""
+        log.info("Starting dynamic actuator discovery...")
+        self.state.actuator_map = {
+            "hover_motors": [],
+            "thrust_motors": [],
+            "control_surfaces": [],
+            "tilt_servos": []
+        }
+        self.state.actuator_limits = {}
+        self.state.discovery_failed = False
+        num_esc = 0
+
+        # 1. Identify active parameter family
+        selected_family = None
+        families = [
+            ("ACT_FUNC", ["ACT_FUNC1"]),
+            ("SIM_GZ", ["SIM_GZ_EC_FUNC1"]),
+            ("HIL", ["HIL_ACT_FUNC1"]),
+            ("PWM", ["PWM_MAIN_FUNC1"])
+        ]
+        
+        for family_name, test_params in families:
+            found = False
+            for p in test_params:
+                try:
+                    await self.read_param(p, attempts=1)
+                    found = True
+                    break
+                except Exception:
+                    pass
+            if found:
+                selected_family = family_name
+                break
+
+        log.info("Discovered parameter family: %s", selected_family)
+        if not selected_family:
+            self.state.discovery_failed = True
+            log.warning("Actuator auto-discovery failed: no parameter family detected.")
+            self._publish_airframe()
+            return
+
+        airframe_class = self.state.airframe.airframe_class if self.state.airframe else "MULTIROTOR"
+
+        def map_func(func_val: int, channel_idx: int):
+            if 101 <= func_val <= 112:
+                # Motor
+                if airframe_class == "MULTIROTOR":
+                    self.state.actuator_map["hover_motors"].append(channel_idx)
+                elif airframe_class in ("FIXED_WING", "DELTA_WING"):
+                    self.state.actuator_map["thrust_motors"].append(channel_idx)
+                elif airframe_class == "VTOL":
+                    if 101 <= func_val <= 104:
+                        self.state.actuator_map["hover_motors"].append(channel_idx)
+                    else:
+                        self.state.actuator_map["thrust_motors"].append(channel_idx)
+            elif 201 <= func_val <= 208:
+                # Servo / Surface
+                self.state.actuator_map["control_surfaces"].append(channel_idx)
+            elif 301 <= func_val <= 308:
+                # Tilt Servo
+                self.state.actuator_map["tilt_servos"].append(channel_idx)
+
+        # 2. Query and map parameters of selected family
+        present_channels = set()
+        try:
+            if selected_family == "ACT_FUNC":
+                for i in range(1, 17):
+                    try:
+                        val = int(await self.read_param(f"ACT_FUNC{i}"))
+                        present_channels.add(i - 1)
+                        if val > 0:
+                            map_func(val, i - 1)
+                    except Exception:
+                        pass
+            elif selected_family == "SIM_GZ":
+                # First detect number of active ESC slots (up to 8)
+                num_esc = 0
+                esc_values = {}
+                for i in range(1, 9):
+                    try:
+                        val = int(await self.read_param(f"SIM_GZ_EC_FUNC{i}"))
+                        present_channels.add(i - 1)
+                        esc_values[i] = val
+                        if val > 0:
+                            num_esc = max(num_esc, i)
+                    except Exception:
+                        pass
+                
+                # Map EC functions to physical channels 1 to num_esc
+                for i in range(1, num_esc + 1):
+                    val = esc_values.get(i, 0)
+                    if val > 0:
+                        map_func(val, i - 1)
+                
+                # Map SV functions starting at num_esc
+                for j in range(1, 9):
+                    try:
+                        val = int(await self.read_param(f"SIM_GZ_SV_FUNC{j}"))
+                        present_channels.add(num_esc + j - 1)
+                        if val > 0:
+                            map_func(val, num_esc + j - 1)
+                    except Exception:
+                        pass
+            elif selected_family == "HIL":
+                for i in range(1, 17):
+                    try:
+                        val = int(await self.read_param(f"HIL_ACT_FUNC{i}"))
+                        present_channels.add(i - 1)
+                        if val > 0:
+                            map_func(val, i - 1)
+                    except Exception:
+                        pass
+            elif selected_family == "PWM":
+                for i in range(1, 9):
+                    try:
+                        val = int(await self.read_param(f"PWM_MAIN_FUNC{i}"))
+                        present_channels.add(i - 1)
+                        if val > 0:
+                            map_func(val, i - 1)
+                    except Exception:
+                        pass
+                for j in range(1, 9):
+                    try:
+                        val = int(await self.read_param(f"PWM_AUX_FUNC{j}"))
+                        present_channels.add(8 + j - 1)
+                        if val > 0:
+                            map_func(val, 8 + j - 1)
+                    except Exception:
+                        pass
+        except Exception as exc:
+            log.exception("Error scanning parameters inside family %s", selected_family)
+
+        # 3. Check if we mapped anything
+        has_mapped = any(len(v) > 0 for v in self.state.actuator_map.values())
+        if not has_mapped:
+            self.state.discovery_failed = True
+            log.warning("Actuator discovery completed but mapped actuator set was empty.")
+        else:
+            self.state.discovery_failed = False
+            active_map = {k: v for k, v in self.state.actuator_map.items() if v}
+            log.info("Discovered actuator map: %s", active_map)
+
+        # 4. Discover limits for present/mapped channels
+        classified = present_channels
+        if not classified:
+            mapped = set()
+            for v in self.state.actuator_map.values():
+                mapped.update(v)
+            classified = mapped if mapped else set(range(8))
+
+        async def fetch_and_store_limits(ch_idx: int):
+            min_val, max_val, trim_val = None, None, None
+
+            def normalize_to_pwm(val: float, role: str) -> float:
+                if selected_family == "SIM_GZ":
+                    # Gazebo simulation parameters are in 0 to 1000 range
+                    return 1000.0 + val
+                if 800 <= val <= 2200:
+                    return val
+                if -1.0 <= val <= 1.0:
+                    return 1500.0 + val * 500.0
+                if role == "min":
+                    return 1000.0
+                elif role == "max":
+                    return 2000.0
+                else:
+                    return 1500.0
+
+            if selected_family == "ACT_FUNC":
+                try:
+                    min_val = await self.read_param(f"OUT{ch_idx + 1}_MIN", attempts=1)
+                except Exception:
+                    pass
+                try:
+                    max_val = await self.read_param(f"OUT{ch_idx + 1}_MAX", attempts=1)
+                except Exception:
+                    pass
+                try:
+                    trim_val = await self.read_param(f"OUT{ch_idx + 1}_TRIM", attempts=1)
+                except Exception:
+                    pass
+            elif selected_family == "SIM_GZ":
+                if ch_idx < num_esc:
+                    esc_idx = ch_idx + 1
+                    try:
+                        min_val = await self.read_param(f"SIM_GZ_EC_MIN{esc_idx}", attempts=1)
+                    except Exception:
+                        pass
+                    try:
+                        max_val = await self.read_param(f"SIM_GZ_EC_MAX{esc_idx}", attempts=1)
+                    except Exception:
+                        pass
+                    try:
+                        trim_val = await self.read_param(f"SIM_GZ_EC_DIS{esc_idx}", attempts=1)
+                    except Exception:
+                        pass
+                else:
+                    sv_idx = ch_idx - num_esc + 1
+                    try:
+                        min_val = await self.read_param(f"SIM_GZ_SV_MIN{sv_idx}", attempts=1)
+                    except Exception:
+                        pass
+                    try:
+                        max_val = await self.read_param(f"SIM_GZ_SV_MAX{sv_idx}", attempts=1)
+                    except Exception:
+                        pass
+                    try:
+                        trim_val = await self.read_param(f"SIM_GZ_SV_DIS{sv_idx}", attempts=1)
+                    except Exception:
+                        pass
+            elif selected_family == "PWM":
+                if ch_idx < 8:
+                    idx = ch_idx + 1
+                    try:
+                        min_val = await self.read_param(f"PWM_MAIN_MIN{idx}", attempts=1)
+                    except Exception:
+                        pass
+                    try:
+                        max_val = await self.read_param(f"PWM_MAIN_MAX{idx}", attempts=1)
+                    except Exception:
+                        pass
+                    try:
+                        trim_val = await self.read_param(f"PWM_MAIN_TRIM{idx}", attempts=1)
+                    except Exception:
+                        pass
+                else:
+                    idx = ch_idx - 7
+                    try:
+                        min_val = await self.read_param(f"PWM_AUX_MIN{idx}", attempts=1)
+                    except Exception:
+                        pass
+                    try:
+                        max_val = await self.read_param(f"PWM_AUX_MAX{idx}", attempts=1)
+                    except Exception:
+                        pass
+                    try:
+                        trim_val = await self.read_param(f"PWM_AUX_TRIM{idx}", attempts=1)
+                    except Exception:
+                        pass
+            elif selected_family == "HIL":
+                try:
+                    min_val = await self.read_param(f"OUT{ch_idx + 1}_MIN", attempts=1)
+                except Exception:
+                    pass
+                try:
+                    max_val = await self.read_param(f"OUT{ch_idx + 1}_MAX", attempts=1)
+                except Exception:
+                    pass
+                try:
+                    trim_val = await self.read_param(f"OUT{ch_idx + 1}_TRIM", attempts=1)
+                except Exception:
+                    pass
+                if min_val is None and ch_idx < 8:
+                    idx = ch_idx + 1
+                    try:
+                        min_val = await self.read_param(f"PWM_MAIN_MIN{idx}", attempts=1)
+                    except Exception:
+                        pass
+                    try:
+                        max_val = await self.read_param(f"PWM_MAIN_MAX{idx}", attempts=1)
+                    except Exception:
+                        pass
+                    try:
+                        trim_val = await self.read_param(f"PWM_MAIN_TRIM{idx}", attempts=1)
+                    except Exception:
+                        pass
+
+            min_pwm = normalize_to_pwm(min_val if min_val is not None else config.DOMAINS_PWM_MIN, "min")
+            max_pwm = normalize_to_pwm(max_val if max_val is not None else (config.DOMAINS_PWM_MIN + config.DOMAINS_PWM_RANGE * 2), "max")
+            trim_pwm = normalize_to_pwm(trim_val if trim_val is not None else config.DOMAINS_PWM_MID, "trim")
+            pwm_range = max(1.0, (max_pwm - min_pwm) / 2.0)
+
+            self.state.actuator_limits[ch_idx] = {
+                "min": min_pwm,
+                "max": max_pwm,
+                "trim": trim_pwm,
+                "range": pwm_range
+            }
+            log.info("Ch %d limits: min=%s, max=%s, trim=%s, range=%s", ch_idx + 1, min_pwm, max_pwm, trim_pwm, pwm_range)
+
+        if classified:
+            for ch in sorted(classified):
+                await fetch_and_store_limits(ch)
+
+        self._publish_airframe()
 
     def _apply_mav_type(self, mav_type: int) -> None:
         """First vehicle HEARTBEAT seen (called on the event loop).
@@ -366,7 +673,7 @@ class ConnectionManager:
     # ------------------------------------------------------------------ #
     # Parameter access (control plane)
     # ------------------------------------------------------------------ #
-    async def read_param(self, name: str) -> float:
+    async def read_param(self, name: str, attempts: int | None = None) -> float:
         """Read a parameter, transparently handling float vs int storage.
 
         MAVSDK param reads can transiently time out when the autopilot is
@@ -380,20 +687,21 @@ class ConnectionManager:
         if not self._system:
             raise ConnectionError("Vehicle not connected")
 
+        attempts = attempts or _PARAM_READ_ATTEMPTS
         delay = _PARAM_RETRY_BASE_S
         last_exc: Exception | None = None
-        for attempt in range(_PARAM_READ_ATTEMPTS):
+        for attempt in range(attempts):
             try:
                 return await self._read_param_once(name)
-            except Exception as exc:  # timeout / busy
+            except (ParamError, TimeoutError, asyncio.TimeoutError, RpcError) as exc:  # timeout / busy / rpc error
                 last_exc = exc
-                if attempt < _PARAM_READ_ATTEMPTS - 1:
+                if attempt < attempts - 1:
                     log.warning("Param read %s failed (attempt %d/%d): %s — retrying",
-                                name, attempt + 1, _PARAM_READ_ATTEMPTS, exc)
+                                name, attempt + 1, attempts, exc)
                     await asyncio.sleep(delay)
                     delay *= 2
         raise TimeoutError(
-            f"Could not read {name} after {_PARAM_READ_ATTEMPTS} attempts: {last_exc}"
+            f"Could not read {name} after {attempts} attempts: {last_exc}"
         )
 
     async def _read_param_once(self, name: str) -> float:
@@ -405,7 +713,7 @@ class ConnectionManager:
         """
         try:
             return await self._system.param.get_param_float(name)
-        except Exception:
+        except (ParamError, RpcError):
             return float(await self._system.param.get_param_int(name))
 
     async def write_approved_param(self, name: str, value: float,

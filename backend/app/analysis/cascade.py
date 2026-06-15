@@ -42,6 +42,7 @@ from . import loop_health
 from .live_pid import LivePidEngine, _quat_to_roll_pitch
 from .recommendations import recommend
 from .regime import REGIME, Regime
+from ..core import config
 
 _R_HEALTHY = 0.85
 _VTOL_STATE_MC, _VTOL_STATE_FW = 3, 4
@@ -155,6 +156,11 @@ class _OuterLoop:
             return
         if not loop_health.inner_loop_healthy(self.name):
             return   # tune inside-out: inner loop first
+
+        # Suppress cascade loop advice if a tuning window is open for a different loop or axis
+        from .stick_monitor import STICK_MONITOR
+        if STICK_MONITOR._tuning_active and (STICK_MONITOR._needed_loop != self.name or STICK_MONITOR._needed_axis != ax):
+            return
         tau, settling = m.get("tau_s"), m.get("settling_s")
         overshoot = m.get("overshoot", 0.0)
         verdict = None
@@ -219,11 +225,11 @@ class CascadeEngine:
 
     def __init__(self) -> None:
         self.attitude = _OuterLoop("attitude", ["roll", "pitch"], 4.0,
-                                   math.radians(5), "deg", _attitude_advice)
+                                   math.radians(config.CASCADE_ATTITUDE_MIN_AMP_DEG), "deg", _attitude_advice)
         self.velocity = _OuterLoop("velocity", ["vx", "vy", "vz"], 6.0,
-                                   0.5, "m/s", _velocity_advice)
+                                   config.CASCADE_VELOCITY_MIN_AMP, "m/s", _velocity_advice)
         self.position = _OuterLoop("position", ["x", "y", "z"], 10.0,
-                                   1.0, "m", _position_advice)
+                                   config.CASCADE_POSITION_MIN_AMP, "m", _position_advice)
         self._task: asyncio.Task | None = None
 
     def start(self) -> None:

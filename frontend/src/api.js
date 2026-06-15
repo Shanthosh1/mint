@@ -16,6 +16,7 @@ async function request(path, options = {}) {
 
 export const api = {
   host: () => request('/api/system/host'),
+  frontendConfig: () => request('/api/system/config/frontend'),
   serialPorts: () => request('/api/system/serial-ports'),
   routerStatus: () => request('/api/system/router'),
   /** target: { mode, serial_device, baud, host, port } */
@@ -26,6 +27,10 @@ export const api = {
   routerStop: () => request('/api/system/router/stop', { method: 'POST' }),
   vehicleConnect: () => request('/api/system/vehicle/connect', { method: 'POST' }),
   vehicleDisconnect: () => request('/api/system/vehicle/disconnect', { method: 'POST' }),
+  updateActuatorMap: (map) =>
+    request('/api/system/actuator-map', {
+      method: 'POST', body: JSON.stringify(map),
+    }),
 
   proposals: () => request('/api/params/proposals'),
   approveProposal: (id) =>
@@ -44,9 +49,9 @@ export const api = {
     request('/api/params/proposals', {
       method: 'POST', body: JSON.stringify(body),
     }),
-  startTuningWindow: (axis) =>
+  startTuningWindow: (axis, loop) =>
     request('/api/params/tuning-window/start', {
-      method: 'POST', body: JSON.stringify({ axis }),
+      method: 'POST', body: JSON.stringify({ axis, loop }),
     }),
   stopTuningWindow: () =>
     request('/api/params/tuning-window/stop', { method: 'POST' }),

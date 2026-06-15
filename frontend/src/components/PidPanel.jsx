@@ -27,6 +27,10 @@ export default function PidPanel() {
   const cascade = useChannelState('cascade_state');
 
   useTelemetryChannel('loop_metrics', (d) => {
+    if (!d) {
+      setLoopMetrics({});
+      return;
+    }
     setLoopMetrics((prev) => ({ ...prev, [d.loop]: d.axes }));
   });
 
@@ -55,7 +59,7 @@ export default function PidPanel() {
 
   const toggleWindow = async () => {
     if (windowOpen) { await api.stopTuningWindow(); setWindowOpen(false); }
-    else { await api.startTuningWindow(axis === 'pitch' ? 'pitch' : axis === 'yaw' ? 'yaw' : 'roll'); setWindowOpen(true); }
+    else { await api.startTuningWindow(axis === 'pitch' ? 'pitch' : axis === 'yaw' ? 'yaw' : 'roll', loop); setWindowOpen(true); }
   };
 
   const rColor = (r) =>
@@ -78,7 +82,7 @@ export default function PidPanel() {
         )}
       </div>
 
-      <div className="row" style={{ marginBottom: 10 }}>
+      <div className="row" style={{ marginBottom: 10, flexWrap: 'wrap' }}>
         {LOOPS.map((l) => {
           const active = activeLoops.has(l);
           return (
@@ -106,7 +110,7 @@ export default function PidPanel() {
         </div>
       )}
 
-      <div className="row" style={{ marginBottom: 12 }}>
+      <div className="row" style={{ marginBottom: 12, flexWrap: 'wrap' }}>
         {axes.map((ax) => {
           const am = metrics[ax];
           return (

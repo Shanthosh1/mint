@@ -25,7 +25,9 @@ import time
 from collections import deque
 
 from ..mavlink.telemetry_hub import HUB
+from ..mavlink.connection import CONNECTION
 from .regime import REGIME, Regime
+from ..core import config
 
 DOMAIN_BY_CLASS = {
     "MULTIROTOR": "differential_thrust",
@@ -34,23 +36,25 @@ DOMAIN_BY_CLASS = {
     "VTOL": "hybrid",
 }
 
-_PWM_MIN, _PWM_MID, _PWM_RANGE = 1000.0, 1500.0, 500.0
-_MOTOR_SAT = 0.98          # normalized output counted as saturated
-_SURFACE_RAIL = 0.96       # |deflection| counted as railed
-_SUSTAIN_WINDOW_S = 1.5
-_SUSTAIN_FRACTION = 0.6    # saturated this share of the window => alert
-_AIRSPEED_REF_WINDOW_S = 30.0
-_ALERT_COOLDOWN_S = 15.0
+_PWM_MIN = config.DOMAINS_PWM_MIN
+_PWM_MID = config.DOMAINS_PWM_MID
+_PWM_RANGE = config.DOMAINS_PWM_RANGE
+_MOTOR_SAT = config.DOMAINS_MOTOR_SAT
+_SURFACE_RAIL = config.DOMAINS_SURFACE_RAIL
+_SUSTAIN_WINDOW_S = config.DOMAINS_SUSTAIN_WINDOW_S
+_SUSTAIN_FRACTION = config.DOMAINS_SUSTAIN_FRACTION
+_AIRSPEED_REF_WINDOW_S = config.DOMAINS_AIRSPEED_REF_WINDOW_S
+_ALERT_COOLDOWN_S = config.DOMAINS_ALERT_COOLDOWN_S
 
 # Motor balance (steady hover only). A quad runs motors at different outputs
 # in level hover to counter prop yaw torque and CG offset; that differential
 # is symmetric about the mean and cancels when each motor's output is
 # *time-averaged* over a hover window. What remains after averaging is a
 # persistent asymmetry — the fault we flag (prop wear, ESC drift, CG offset).
-_BALANCE_WINDOW_S = 4.0        # hover averaging window
-_BALANCE_MIN_SAMPLES = 20      # need enough hover samples to trust the average
-_BALANCE_WARN_FRAC = 0.15      # a motor avg >15% off the fleet mean => advisory
-_BALANCE_ALERT_COOLDOWN_S = 60.0
+_BALANCE_WINDOW_S = config.DOMAINS_BALANCE_WINDOW_S
+_BALANCE_MIN_SAMPLES = config.DOMAINS_BALANCE_MIN_SAMPLES
+_BALANCE_WARN_FRAC = config.DOMAINS_BALANCE_WARN_FRAC
+_BALANCE_ALERT_COOLDOWN_S = config.DOMAINS_BALANCE_ALERT_COOLDOWN_S
 
 
 def domain_for(airframe_class: str | None) -> str | None:
@@ -71,6 +75,18 @@ class ActuationMonitor:
         self._last_alert: dict[str, float] = {}
         self._task: asyncio.Task | None = None
 
+    @property
+    def domain(self) -> str | None:
+        if self._domain is not None:
+            return self._domain
+        if CONNECTION.state.airframe:
+            self._domain = domain_for(CONNECTION.state.airframe.airframe_class)
+        return self._domain
+
+    @domain.setter
+    def domain(self, val: str | None) -> None:
+        self._domain = val
+
     def start(self) -> None:
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._run(), name="actuation-monitor")
@@ -81,13 +97,44 @@ class ActuationMonitor:
 
     # ------------------------------------------------------------------ #
     async def _run(self) -> None:
+        # ACTUATOR_OUTPUT_STATUS is the primary source (PX4 v1.13+).
+        # SERVO_OUTPUT_RAW is the legacy fallback — only used if the modern
+        # message never arrives after a grace period.
+        self._got_actuator_status = False
+        self._servo_fallback_ok = False
+        self._first_servo_at: float | None = None
+        self._vtol_state = 0
+        _GRACE_PERIOD_S = 3.0  # wait this long for modern msg before fallback
+
         async for event in HUB.subscribe():
             if event.channel == "airframe":
-                self._domain = domain_for(event.payload.get("airframe_class"))
+                self.domain = domain_for(event.payload.get("airframe_class"))
             elif event.channel == "vfr_hud":
                 self._track_airspeed(event.payload)
-            elif event.channel == "servo_output" and self._domain:
-                self._process(event.payload)
+            elif event.channel == "extended_sys_state":
+                self._vtol_state = int(event.payload.get("vtol_state", 0) or 0)
+
+            elif event.channel == "actuator_output_status":
+                # Primary source — always process, suppress legacy
+                self._got_actuator_status = True
+                self._servo_fallback_ok = False
+                self._process_actuator_status(event.payload)
+
+            elif event.channel == "servo_output":
+                if self._got_actuator_status:
+                    # Modern source is active — ignore legacy
+                    continue
+                # Grace period: suppress SERVO_OUTPUT_RAW for the first N
+                # seconds to give ACTUATOR_OUTPUT_STATUS time to arrive.
+                now = time.monotonic()
+                if self._first_servo_at is None:
+                    self._first_servo_at = now
+                if not self._servo_fallback_ok:
+                    if now - self._first_servo_at < _GRACE_PERIOD_S:
+                        continue  # still waiting for modern message
+                    # Grace period expired — modern message never came, use legacy
+                    self._servo_fallback_ok = True
+                self._process_servo_output(event.payload)
 
     def _track_airspeed(self, vfr: dict) -> None:
         now = time.monotonic()
@@ -113,34 +160,196 @@ class ActuationMonitor:
         return (self._airspeed / ref) ** 2
 
     # ------------------------------------------------------------------ #
-    def _process(self, servo: dict) -> None:
-        raws = [float(servo.get(f"servo{i}_raw", 0) or 0) for i in range(1, 9)]
-        valid = [v for v in raws if 800 < v < 2300]
-        if not valid:
+    def _process_servo_output(self, servo: dict) -> None:
+        raws = [float(servo.get(f"servo{i}_raw", 0) or 0) for i in range(1, 17)]
+        if not any(800 < v < 2300 for v in raws):
             return
-        now = time.monotonic()
-        payload: dict = {"domain": self._domain}
+        self._process_channels(raws, is_raw=True)
 
-        if self._domain in ("differential_thrust", "hybrid"):
-            norms = [min(1.0, max(0.0, (v - _PWM_MIN) / 1000.0)) for v in valid]
+    def _process_actuator_status(self, payload: dict) -> None:
+        actuator = payload.get("actuator") or []
+        if not actuator:
+            return
+        self._process_channels(actuator, is_raw=False)
+
+    def _process_channels(self, values: list[float], is_raw: bool) -> None:
+        now = time.monotonic()
+        payload: dict = {"domain": self.domain}
+        
+        # Determine mapping channels — exclusively from dynamic discovery
+        # (live MAVLink params, ULog initial_parameters, or manual pilot config).
+        # No hardcoded guessing: if discovery hasn't run or failed, all
+        # channels appear as "unclassified" in the UI until the pilot
+        # configures them via the manual mapping dialog.
+        actuator_map = getattr(CONNECTION.state, "actuator_map", None)
+        has_mapped_channels = False
+        if actuator_map:
+            has_mapped_channels = any(len(v) > 0 for v in actuator_map.values())
+            
+        if has_mapped_channels:
+            hover_channels = actuator_map.get("hover_motors", [])
+            thrust_channels = actuator_map.get("thrust_motors", [])
+            surface_channels = actuator_map.get("control_surfaces", [])
+            tilt_channels = actuator_map.get("tilt_servos", [])
+        else:
+            # No dynamic mapping available — everything is unclassified.
+            # The pilot can fix this via the manual actuator config dialog.
+            hover_channels = []
+            thrust_channels = []
+            surface_channels = []
+            tilt_channels = []
+            payload["unmapped"] = True
+
+        # ---- Always include ALL mapped channels + active unmapped as raw bars ----
+        classified = set(hover_channels) | set(thrust_channels) | set(surface_channels) | set(tilt_channels)
+        raw_channels = []
+        raw_pwms_by_ch = {}
+        for i, v in enumerate(values):
+            is_mapped = i in classified
+            
+            # Fetch limits from connection state
+            limits = getattr(CONNECTION.state, "actuator_limits", {}).get(i)
+            if limits:
+                ch_min = limits["min"]
+                ch_max = limits["max"]
+                ch_trim = limits["trim"]
+                ch_range = max(1.0, ch_max - ch_min)
+            else:
+                ch_min = _PWM_MIN
+                ch_max = _PWM_MIN + _PWM_RANGE * 2
+                ch_trim = _PWM_MID
+                ch_range = max(1.0, ch_max - ch_min)
+
+            if is_raw:
+                raw_pwm = v
+            else:
+                import math
+                raw_v = 0.0 if math.isnan(v) else v
+                is_motor = (i in hover_channels) or (i in thrust_channels)
+                if is_motor:
+                    # Unidirectional mapping: [-1.0, 1.0] -> [ch_min, ch_max]
+                    raw_pwm = ch_min + (raw_v + 1.0) / 2.0 * ch_range
+                else:
+                    # Bidirectional mapping with ch_trim as center
+                    if raw_v >= 0.0:
+                        raw_pwm = ch_trim + raw_v * (ch_max - ch_trim)
+                    else:
+                        raw_pwm = ch_trim + raw_v * (ch_trim - ch_min)
+
+            if raw_pwm < 800:
+                norm = 0.0
+            else:
+                norm = (raw_pwm - ch_min) / ch_range
+                norm = min(1.0, max(0.0, norm))
+
+            raw_pwms_by_ch[i] = raw_pwm
+
+            if is_raw:
+                admit = is_mapped or 800 < v < 2300
+            else:
+                import math
+                admit = is_mapped or (not math.isnan(v) and abs(v) > 0.001)
+
+            if admit:
+                raw_channels.append({
+                    "ch": i + 1,
+                    "raw": round(raw_pwm),
+                    "norm": round(norm, 3),
+                    "min": ch_min,
+                    "max": ch_max,
+                    "trim": ch_trim,
+                    "classified": is_mapped,
+                })
+        payload["raw_channels"] = raw_channels
+
+        # 1. Process Hover Motors — always include mapped channels
+        norms = []
+        hover_mapped_ch = []
+        if hover_channels:
+            for ch in hover_channels:
+                if ch < len(values):
+                    raw_pwm = raw_pwms_by_ch.get(ch, _PWM_MID)
+                    if raw_pwm < 800:
+                        norms.append(0.0)
+                    else:
+                        limits = getattr(CONNECTION.state, "actuator_limits", {}).get(ch)
+                        if limits:
+                            ch_min = limits["min"]
+                            ch_max = limits["max"]
+                        else:
+                            ch_min = _PWM_MIN
+                            ch_max = _PWM_MIN + _PWM_RANGE * 2
+                        ch_range = max(1.0, ch_max - ch_min)
+                        norms.append(min(1.0, max(0.0, (raw_pwm - ch_min) / ch_range)))
+                    hover_mapped_ch.append(ch + 1)
+                        
+        if self.domain == "hybrid" and self._vtol_state == 4:
+            norms = [0.0] * len(norms)
+
+        if norms:
             sat_index = sum(1 for n in norms if n >= _MOTOR_SAT) / len(norms)
             payload["motor_sat_index"] = round(sat_index, 2)
             payload["motor_max"] = round(max(norms), 2)
-            # Per-channel normalized outputs (0..1) for the live bar display.
             payload["motor_norms"] = [round(n, 3) for n in norms]
+            payload["motor_channels"] = hover_mapped_ch
             self._sustained_check("motor", sat_index > 0, now, severity="warning",
-                                  text="Motor saturation: one or more motors pinned at "
-                                       "maximum output. Reduce aggressive rate gains, "
-                                       "payload, or maneuver intensity.")
+                                   text="Motor saturation: one or more motors pinned at "
+                                        "maximum output. Reduce aggressive rate gains, "
+                                        "payload, or maneuver intensity.")
             balance = self._check_motor_balance(norms, now)
             if balance is not None:
                 payload["motor_balance"] = balance
 
-        if self._domain in ("aerodynamic_surface", "hybrid"):
-            defl = [(v - _PWM_MID) / _PWM_RANGE for v in valid]
+        # 2. Process Thrust Motors — always include mapped channels
+        thrust_norms = []
+        thrust_mapped_ch = []
+        if thrust_channels:
+            for ch in thrust_channels:
+                if ch < len(values):
+                    raw_pwm = raw_pwms_by_ch.get(ch, _PWM_MID)
+                    if raw_pwm < 800:
+                        thrust_norms.append(0.0)
+                    else:
+                        limits = getattr(CONNECTION.state, "actuator_limits", {}).get(ch)
+                        if limits:
+                            ch_min = limits["min"]
+                            ch_max = limits["max"]
+                        else:
+                            ch_min = _PWM_MIN
+                            ch_max = _PWM_MIN + _PWM_RANGE * 2
+                        ch_range = max(1.0, ch_max - ch_min)
+                        thrust_norms.append(min(1.0, max(0.0, (raw_pwm - ch_min) / ch_range)))
+                    thrust_mapped_ch.append(ch + 1)
+        if thrust_norms:
+            payload["thrust_norms"] = [round(tn, 3) for tn in thrust_norms]
+            payload["thrust_channels"] = thrust_mapped_ch
+
+        # 3. Process Control Surfaces — always include mapped channels
+        defl = []
+        surf_mapped_ch = []
+        if surface_channels:
+            for ch in surface_channels:
+                if ch < len(values):
+                    raw_pwm = raw_pwms_by_ch.get(ch, _PWM_MID)
+                    if raw_pwm < 800:
+                        defl.append(0.0)
+                    else:
+                        limits = getattr(CONNECTION.state, "actuator_limits", {}).get(ch)
+                        if limits:
+                            ch_trim = limits["trim"]
+                            ch_range = limits["range"]
+                        else:
+                            ch_trim = _PWM_MID
+                            ch_range = _PWM_RANGE
+                        d = (raw_pwm - ch_trim) / ch_range
+                        defl.append(min(1.0, max(-1.0, d)))
+                    surf_mapped_ch.append(ch + 1)
+                        
+        if defl:
             railed = [i for i, d in enumerate(defl) if abs(d) >= _SURFACE_RAIL]
             q_ratio = self._reference_q_ratio()
             payload["surface_deflections"] = [round(d, 2) for d in defl]
+            payload["surface_channels"] = surf_mapped_ch
             payload["railed_channels"] = railed
             payload["q_ratio"] = round(q_ratio, 2) if q_ratio is not None else None
 
@@ -160,6 +369,30 @@ class ActuationMonitor:
                 self._sustained_check("surface_hi_q", False, now, "", "")
                 self._sustained_check("surface_lo_q", False, now, "", "")
 
+        # 4. Process Tilt Servos — always include mapped channels
+        tilt_defl = []
+        tilt_mapped_ch = []
+        if tilt_channels:
+            for ch in tilt_channels:
+                if ch < len(values):
+                    raw_pwm = raw_pwms_by_ch.get(ch, _PWM_MID)
+                    if raw_pwm < 800:
+                        tilt_defl.append(0.0)
+                    else:
+                        limits = getattr(CONNECTION.state, "actuator_limits", {}).get(ch)
+                        if limits:
+                            ch_trim = limits["trim"]
+                            ch_range = limits["range"]
+                        else:
+                            ch_trim = _PWM_MID
+                            ch_range = _PWM_RANGE
+                        d = (raw_pwm - ch_trim) / ch_range
+                        tilt_defl.append(min(1.0, max(-1.0, d)))
+                    tilt_mapped_ch.append(ch + 1)
+        if tilt_defl:
+            payload["tilt_deflections"] = [round(td, 2) for td in tilt_defl]
+            payload["tilt_channels"] = tilt_mapped_ch
+
         HUB.publish("actuation", payload)
 
     def _check_motor_balance(self, norms: list[float], now: float) -> dict | None:
@@ -178,8 +411,9 @@ class ActuationMonitor:
         # Reset history the moment we leave steady hover so a maneuver's
         # differential thrust never leaks into the next hover average.
         if REGIME.current != Regime.STEADY_HOLD:
-            if self._motor_hist:
-                self._motor_hist.clear()
+            for hist in self._motor_hist.values():
+                while hist and hist[0][0] < now - 0.5:
+                    hist.popleft()
             return None
 
         horizon = now - _BALANCE_WINDOW_S
