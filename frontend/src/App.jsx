@@ -93,7 +93,7 @@ export default function App() {
         </div>
       </header>
 
-      {page === 'live' && (
+      <div style={{ display: page === 'live' ? 'block' : 'none' }}>
         <div className="grid animate-fade">
           <div className="col">
             <ActuatorPanel />
@@ -111,13 +111,13 @@ export default function App() {
             <ProposalsPanel />
           </div>
         </div>
-      )}
+      </div>
 
-      {page === 'postflight' && (
+      <div style={{ display: page === 'postflight' ? 'block' : 'none' }}>
         <div className="postflight-page animate-fade">
           <UlogPanel />
         </div>
-      )}
+      </div>
     </div>
   );
 }

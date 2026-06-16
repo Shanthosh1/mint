@@ -78,7 +78,9 @@ class VtolMonitor:
 
     # ------------------------------------------------------------------ #
     async def _run(self) -> None:
-        async for event in HUB.subscribe():
+        async for event in HUB.subscribe(channels=frozenset({
+            "extended_sys_state", "vfr_hud", "attitude", "actuation"
+        })):
             if not self._is_vtol():
                 continue
             now = time.monotonic()

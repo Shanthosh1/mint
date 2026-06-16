@@ -58,6 +58,7 @@ _WATCHED_MESSAGES = {
     "EXTENDED_SYS_STATE": "extended_sys_state",  # VTOL transition state
     "LOCAL_POSITION_NED": "local_position",       # velocity/position loops
     "POSITION_TARGET_LOCAL_NED": "position_target",  # velocity/position setpoints
+    "LOCAL_POSITION_NED_COV": "local_position_setpoint", # velocity/position setpoints in POSCTL
 }
 
 _MAV_TYPE_GCS = 6  # ignore heartbeats from other ground stations on the link

@@ -59,15 +59,21 @@ class CascadeState:
     def __init__(self) -> None:
         self.mode: str = "UNKNOWN"
         self.vtol_state: int = 0
+        self._domain: str = "MC"
+
+    def recalculate_domain(self) -> str:
+        af = CONNECTION.state.airframe
+        cls = af.airframe_class if af else "MULTIROTOR"
+        if cls == "VTOL":
+            self._domain = "FW" if self.vtol_state == _VTOL_STATE_FW else "MC"
+        else:
+            self._domain = "FW" if cls in ("FIXED_WING", "DELTA_WING") else "MC"
+        return self._domain
 
     @property
     def domain(self) -> str:
         """Control domain right now: 'MC' or 'FW'."""
-        af = CONNECTION.state.airframe
-        cls = af.airframe_class if af else "MULTIROTOR"
-        if cls == "VTOL":
-            return "FW" if self.vtol_state == _VTOL_STATE_FW else "MC"
-        return "FW" if cls in ("FIXED_WING", "DELTA_WING") else "MC"
+        return self.recalculate_domain()
 
     def loops_active(self) -> set[str]:
         return active_loops(self.mode, self.domain)
@@ -93,13 +99,17 @@ class _OuterLoop:
 
     def __init__(self, name: str, axes: list[str], window_s: float,
                  min_amp: float, unit: str,
-                 advisor: Callable[[str, str, dict, str], None]):
+                 advisor: Callable[[str, str, dict, str], None],
+                 sp_stable_window_s: float = 0.15,
+                 osc_window_s: float = 2.0):
         self.name = name
         self.axes = axes
         self.window_s = window_s
         self.min_amp = min_amp
         self.unit = unit
         self.advisor = advisor            # (axis, verdict, metrics, domain)
+        self.sp_stable_window_s = sp_stable_window_s
+        self.osc_window_s = osc_window_s
         self.win: dict[str, deque] = {ax: deque() for ax in axes}
         self.latest_sp: dict[str, float] = {}
         self.last_eval = 0.0
@@ -135,8 +145,21 @@ class _OuterLoop:
             t = np.array([s[0] for s in w])
             sp = np.array([s[1] for s in w])
             act = np.array([s[2] for s in w])
+
+            # Data-driven activity check for velocity/position loops
+            if self.name in ("velocity", "position"):
+                act_std = float(np.std(act))
+                threshold = 0.1 if self.name == "velocity" else 0.3
+                is_active = (act_std > threshold) or STATE.auto_flight()
+                if not is_active:
+                    continue  # skip inactive axes
+
             m = LivePidEngine._tracking_metrics(sp, act)
-            step = LivePidEngine._step_response(t, sp, act, min_amp=self.min_amp)
+            step = LivePidEngine._step_response(
+                t, sp, act, min_amp=self.min_amp,
+                sp_stable_window_s=self.sp_stable_window_s,
+                osc_window_s=self.osc_window_s
+            )
             if step:
                 m.update(step)
             m["sp"], m["act"] = round(float(sp[-1]), 2), round(float(act[-1]), 2)
@@ -152,7 +175,7 @@ class _OuterLoop:
                                          "unit": self.unit})
 
     def _verdict(self, ax: str, m: dict, now: float) -> None:
-        if now - self.last_advice.get(ax, 0) < 30:
+        if now - self.last_advice.get(ax, 0) < 15:
             return
         if not loop_health.inner_loop_healthy(self.name):
             return   # tune inside-out: inner loop first
@@ -185,7 +208,7 @@ def _attitude_advice(ax: str, verdict: str, m: dict, domain: str) -> None:
             return
         scale = 0.9 if verdict == "overshoot" else 1.1
         recommend(param, f"{pretty} — {'soften' if scale < 1 else 'raise'} the "
-                         f"attitude P gain.", scale_factor=scale, source="cascade")
+                         f"attitude P gain.", scale_factor=scale, source="cascade", cooldown_s=15.0)
     else:
         # FW attitude is a time constant: bigger = slower. Sluggish means
         # the TC should shrink; overshoot means it should grow.
@@ -194,18 +217,44 @@ def _attitude_advice(ax: str, verdict: str, m: dict, domain: str) -> None:
             return
         delta = +0.05 if verdict == "overshoot" else -0.05
         recommend(param, f"{pretty} — {'slow' if delta > 0 else 'tighten'} the "
-                         f"{ax} time constant.", delta=delta, source="cascade")
+                         f"{ax} time constant.", delta=delta, source="cascade", cooldown_s=15.0)
 
 
 def _velocity_advice(ax: str, verdict: str, m: dict, domain: str) -> None:
     if domain != "MC":
         return   # FW speed/altitude is TECS territory — out of live scope
-    param = "MPC_Z_VEL_P_ACC" if ax == "vz" else "MPC_XY_VEL_P_ACC"
+    
+    p_param = "MPC_Z_VEL_P_ACC" if ax == "vz" else "MPC_XY_VEL_P_ACC"
     scale = 0.9 if verdict == "overshoot" else 1.1
-    recommend(param,
+    recommend(p_param,
               f"{ax} velocity {verdict} (overshoot {m.get('overshoot', 0)*100:.0f}%, "
               f"τ={m.get('tau_s')}s) — {'soften' if scale < 1 else 'raise'} the "
-              f"velocity P gain.", scale_factor=scale, source="cascade")
+              f"velocity P gain.", scale_factor=scale, source="cascade", cooldown_s=15.0)
+
+    # I-gain / persistent offset advice
+    r = m.get("r")
+    sp_val = m.get("sp", 0.0)
+    act_val = m.get("act", 0.0)
+    offset = abs(sp_val - act_val)
+    tau = m.get("tau_s")
+    
+    if r is not None and r < 0.8 and offset > 0.1 and tau is None:
+        i_param = "MPC_Z_VEL_I_ACC" if ax == "vz" else "MPC_XY_VEL_I_ACC"
+        recommend(i_param,
+                  f"{ax} velocity has persistent tracking error (r={r:.2f}, offset={offset:.2f} m/s) "
+                  f"without clean step response — raise the velocity I gain.",
+                  scale_factor=1.15, source="cascade", cooldown_s=15.0)
+
+    # D-gain / damping / oscillatory advice
+    settling = m.get("settling_s")
+    overshoot = m.get("overshoot", 0.0)
+    
+    if overshoot > 0.15 and (settling is None or (settling is not None and tau is not None and settling > 3 * tau)):
+        d_param = "MPC_Z_VEL_D_ACC" if ax == "vz" else "MPC_XY_VEL_D_ACC"
+        recommend(d_param,
+                  f"{ax} velocity is oscillatory (overshoot {overshoot*100:.0f}%, "
+                  f"settling={settling or 'never'}s) — raise the velocity D gain to add damping.",
+                  scale_factor=1.15, source="cascade", cooldown_s=15.0)
 
 
 def _position_advice(ax: str, verdict: str, m: dict, domain: str) -> None:
@@ -216,7 +265,7 @@ def _position_advice(ax: str, verdict: str, m: dict, domain: str) -> None:
     recommend(param,
               f"{ax} position {verdict} across recent setpoint changes — "
               f"{'soften' if scale < 1 else 'raise'} the position P gain.",
-              scale_factor=scale, source="cascade")
+              scale_factor=scale, source="cascade", cooldown_s=15.0)
 
 
 # ---------------------------------------------------------------------- #
@@ -225,11 +274,14 @@ class CascadeEngine:
 
     def __init__(self) -> None:
         self.attitude = _OuterLoop("attitude", ["roll", "pitch"], 4.0,
-                                   math.radians(config.CASCADE_ATTITUDE_MIN_AMP_DEG), "deg", _attitude_advice)
+                                   math.radians(config.CASCADE_ATTITUDE_MIN_AMP_DEG), "deg", _attitude_advice,
+                                   sp_stable_window_s=0.15, osc_window_s=2.0)
         self.velocity = _OuterLoop("velocity", ["vx", "vy", "vz"], 6.0,
-                                   config.CASCADE_VELOCITY_MIN_AMP, "m/s", _velocity_advice)
+                                   config.CASCADE_VELOCITY_MIN_AMP, "m/s", _velocity_advice,
+                                   sp_stable_window_s=1.0, osc_window_s=4.0)
         self.position = _OuterLoop("position", ["x", "y", "z"], 10.0,
-                                   config.CASCADE_POSITION_MIN_AMP, "m", _position_advice)
+                                   config.CASCADE_POSITION_MIN_AMP, "m", _position_advice,
+                                   sp_stable_window_s=2.0, osc_window_s=6.0)
         self._task: asyncio.Task | None = None
 
     def start(self) -> None:
@@ -242,17 +294,26 @@ class CascadeEngine:
 
     # ------------------------------------------------------------------ #
     async def _run(self) -> None:
-        async for event in HUB.subscribe():
+        async for event in HUB.subscribe(channels=frozenset({
+            "flight_mode", "extended_sys_state", "airframe",
+            "attitude_target", "attitude", "position_target",
+            "local_position_setpoint", "local_position"
+        })):
             now = time.monotonic()
             ch, p = event.channel, event.payload
             if ch == "flight_mode":
                 STATE.mode = p.get("mode", STATE.mode)
+                STATE.recalculate_domain()
                 HUB.publish("cascade_state", STATE.snapshot())
             elif ch == "extended_sys_state":
                 prev = STATE.vtol_state
                 STATE.vtol_state = int(p.get("vtol_state", 0) or 0)
                 if STATE.vtol_state != prev:
+                    STATE.recalculate_domain()
                     HUB.publish("cascade_state", STATE.snapshot())
+            elif ch == "airframe":
+                STATE.recalculate_domain()
+                HUB.publish("cascade_state", STATE.snapshot())
             elif ch == "attitude_target":
                 self._feed_attitude_sp(p)
             elif ch == "attitude":
@@ -260,6 +321,8 @@ class CascadeEngine:
                            {"roll": p.get("roll"), "pitch": p.get("pitch")}, now)
             elif ch == "position_target":
                 self._feed_position_sp(p)
+            elif ch == "local_position_setpoint":
+                self._feed_local_position_setpoint(p)
             elif ch == "local_position":
                 self._feed(self.velocity,
                            {a: p.get(a) for a in ("vx", "vy", "vz")}, now)
@@ -269,10 +332,13 @@ class CascadeEngine:
     def _loop_enabled(self, loop: _OuterLoop) -> bool:
         if loop.name not in STATE.loops_active():
             return False
-        # Pilot maneuvers OR autopilot-generated setpoint changes both
-        # exercise the loops; in AUTO the sticks are silent by design.
-        return (REGIME.current == Regime.DYNAMIC_MANEUVER
-                or STATE.auto_flight())
+        if loop.name == "attitude":
+            return (REGIME.current == Regime.DYNAMIC_MANEUVER
+                    or STATE.auto_flight())
+        else:
+            return (REGIME.current == Regime.DYNAMIC_MANEUVER
+                    or STATE.auto_flight()
+                    or STATE.mode in ("POSCTL", "ALTCTL"))
 
     def _feed(self, loop: _OuterLoop, values: dict, now: float) -> None:
         if not self._loop_enabled(loop):
@@ -296,6 +362,12 @@ class CascadeEngine:
         if (mask & _MASK_POS) != _MASK_POS:   # position fields valid
             self.position.feed_sp({a: float(p[a]) for a in ("x", "y", "z")
                                    if p.get(a) is not None})
+
+    def _feed_local_position_setpoint(self, p: dict) -> None:
+        self.velocity.feed_sp({a: float(p[a]) for a in ("vx", "vy", "vz")
+                               if p.get(a) is not None})
+        self.position.feed_sp({a: float(p[a]) for a in ("x", "y", "z")
+                               if p.get(a) is not None})
 
 
 CASCADE = CascadeEngine()

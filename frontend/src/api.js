@@ -39,11 +39,7 @@ export const api = {
     request(`/api/params/proposals/${id}`, { method: 'DELETE' }),
   revertProposal: (id) =>
     request(`/api/params/proposals/${id}/revert`, { method: 'POST' }),
-  /** outcome: 'better' | 'worse' | 'no_change' */
-  proposalFeedback: (id, outcome) =>
-    request(`/api/params/proposals/${id}/feedback`, {
-      method: 'POST', body: JSON.stringify({ outcome }),
-    }),
+
   /** body: { param, rationale, and exactly one of target_value | scale_factor | delta } */
   createProposal: (body) =>
     request('/api/params/proposals', {
@@ -56,6 +52,7 @@ export const api = {
   stopTuningWindow: () =>
     request('/api/params/tuning-window/stop', { method: 'POST' }),
 
+  getReport: (fileHash) => request(`/api/report/${fileHash}`),
   analyzeUlog: async (file, onProgress) => {
     // FormData upload — let the browser set the multipart boundary.
     const form = new FormData();

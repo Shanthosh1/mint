@@ -29,7 +29,10 @@ def recommend(param: str, rationale: str, *,
               cooldown_s: float = 30.0,
               is_saturation_gain_reduction: bool = False,
               confidence: Optional[str] = None,
-              limitations: Optional[str] = None) -> None:
+              limitations: Optional[str] = None,
+              pre_step_motion: bool = False,
+              ramped_input: bool = False,
+              low_coherence: bool = False) -> None:
     """Publish a structured recommendation (exactly one change form)."""
     forms = [v is not None for v in (scale_factor, delta, target_value)]
     if sum(forms) != 1:
@@ -53,4 +56,8 @@ def recommend(param: str, rationale: str, *,
         "is_saturation_gain_reduction": is_saturation_gain_reduction,
         "confidence": confidence,
         "limitations": limitations,
+        "pre_step_motion": pre_step_motion,
+        "ramped_input": ramped_input,
+        "low_coherence": low_coherence,
     })
+

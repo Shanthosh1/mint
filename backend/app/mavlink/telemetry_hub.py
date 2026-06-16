@@ -45,7 +45,7 @@ class TelemetryHub:
 
     def __init__(self, queue_size: int = 256):
         self._queue_size = queue_size
-        self._subscribers: dict[int, asyncio.Queue[Event]] = {}
+        self._subscribers: dict[int, tuple[asyncio.Queue[Event], Optional[frozenset[str]]]] = {}
         self._next_id = 0
         self._channel_counts: dict[str, int] = defaultdict(int)
         # Monotonic timestamp of the last publish per channel — drives
@@ -71,7 +71,9 @@ class TelemetryHub:
             if channel == "loop_metrics":
                 key = f"loop_metrics:{payload.get('loop', '')}"
             self._latest[key] = event
-        for q in self._subscribers.values():
+        for q, filter_set in list(self._subscribers.values()):
+            if filter_set is not None and channel not in filter_set:
+                continue
             if q.full():
                 try:
                     q.get_nowait()  # evict oldest
@@ -79,12 +81,13 @@ class TelemetryHub:
                     pass
             q.put_nowait(event)
 
-    async def subscribe(self) -> AsyncIterator[Event]:
-        """Async iterator yielding every event until the consumer cancels."""
+    async def subscribe(self, channels: Optional[set[str] | frozenset[str]] = None) -> AsyncIterator[Event]:
+        """Async iterator yielding every matching event until the consumer cancels."""
         sub_id = self._next_id
         self._next_id += 1
         q: asyncio.Queue[Event] = asyncio.Queue(self._queue_size)
-        self._subscribers[sub_id] = q
+        filter_set = frozenset(channels) if channels is not None else None
+        self._subscribers[sub_id] = (q, filter_set)
         try:
             while True:
                 yield await q.get()

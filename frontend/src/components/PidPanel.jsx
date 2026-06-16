@@ -50,6 +50,12 @@ export default function PidPanel() {
     }
   }, [cascade?.mode, cascade?.domain]);   // eslint-disable-line
 
+  useEffect(() => {
+    if (windowOpen) {
+      api.startTuningWindow(axis, loop).catch(() => {});
+    }
+  }, [axis, loop, windowOpen]);
+
   const cfg = LOOP_CONFIG[loop];
   const axes = cfg.axes;
   const metrics = loopMetrics[loop] ?? {};

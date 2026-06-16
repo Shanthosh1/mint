@@ -47,10 +47,17 @@ class ActuatorMapConfig(BaseModel):
     tilt_servos: list[int] = Field(default_factory=list)
 
 
+import uuid
+
+BACKEND_SESSION_ID = str(uuid.uuid4())
+
+
 @router.get("/host")
 def host_info() -> dict:
     """OS autodetection + router binary availability."""
-    return platform_utils.host_info_dict()
+    info = platform_utils.host_info_dict()
+    info["backend_session_id"] = BACKEND_SESSION_ID
+    return info
 
 
 @router.get("/serial-ports")

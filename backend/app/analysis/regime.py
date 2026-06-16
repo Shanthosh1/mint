@@ -70,7 +70,9 @@ class RegimeClassifier:
 
     # ------------------------------------------------------------------ #
     async def _run(self) -> None:
-        async for event in HUB.subscribe():
+        async for event in HUB.subscribe(channels=frozenset({
+            "vfr_hud", "manual_control"
+        })):
             now = time.monotonic()
             if event.channel == "vfr_hud":
                 self._last_vfr = event.payload
@@ -93,10 +95,9 @@ class RegimeClassifier:
         """Max per-axis population variance over the rolling window."""
         if len(self._sticks) < 5:
             return 0.0
-        return max(
-            statistics.pvariance([s[i] for s in self._sticks])
-            for i in (1, 2, 3)
-        )
+        import numpy as np
+        arr = np.array(self._sticks)
+        return float(np.max(np.var(arr[:, 1:4], axis=0)))
 
     def _in_flight(self, now: float) -> bool:
         if now - self._last_vfr_at > _VFR_STALE_S:

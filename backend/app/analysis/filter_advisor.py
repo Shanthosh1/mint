@@ -100,28 +100,48 @@ def measure_filter_delay_ms(sensor: pd.DataFrame | None,
     """Lag of the filtered rate signal behind the raw gyro (ms)."""
     if sensor is None or ang_vel is None:
         return None
-    if "gyro_rad[0]" not in sensor.columns or "xyz[0]" not in ang_vel.columns:
-        return None
+        
     fs = 200.0
-    t_r, raw = _resample_uniform(sensor["timestamp"].to_numpy(np.float64),
-                                 sensor["gyro_rad[0]"].to_numpy(np.float64), fs)
-    t_f, flt = _resample_uniform(ang_vel["timestamp"].to_numpy(np.float64),
-                                 ang_vel["xyz[0]"].to_numpy(np.float64), fs)
-    t0, t1 = max(t_r[0], t_f[0]), min(t_r[-1], t_f[-1])
-    if t1 - t0 < 10:
+    delays = []
+    
+    for i in range(3):
+        raw_col = f"gyro_rad[{i}]"
+        flt_col = f"xyz[{i}]"
+        if raw_col not in sensor.columns or flt_col not in ang_vel.columns:
+            continue
+            
+        t_r, raw = _resample_uniform(sensor["timestamp"].to_numpy(np.float64),
+                                     sensor[raw_col].to_numpy(np.float64), fs)
+        t_f, flt = _resample_uniform(ang_vel["timestamp"].to_numpy(np.float64),
+                                     ang_vel[flt_col].to_numpy(np.float64), fs)
+        t0, t1 = max(t_r[0], t_f[0]), min(t_r[-1], t_f[-1])
+        if t1 - t0 < 10:
+            continue
+            
+        a = raw[(t_r >= t0) & (t_r <= t1)]
+        b = flt[(t_f >= t0) & (t_f <= t1)]
+        n = min(len(a), len(b))
+        if n < 20:
+            continue
+            
+        try:
+            a, b = signal.detrend(a[:n]), signal.detrend(b[:n])
+            corr = signal.correlate(a, b, mode="full")
+            lags = signal.correlation_lags(n, n, mode="full") / fs
+            window = np.abs(lags) <= 0.1
+            best = float(lags[window][np.argmax(corr[window])])
+            delay = max(0.0, -best * 1000.0)
+            
+            # Sanity check: delay > 50 ms is suspect, filter it out
+            if delay <= 50.0:
+                delays.append(delay)
+        except Exception:
+            continue
+            
+    if not delays:
         return None
-    a = raw[(t_r >= t0) & (t_r <= t1)]
-    b = flt[(t_f >= t0) & (t_f <= t1)]
-    n = min(len(a), len(b))
-    a, b = signal.detrend(a[:n]), signal.detrend(b[:n])
-
-    corr = signal.correlate(a, b, mode="full")
-    lags = signal.correlation_lags(n, n, mode="full") / fs
-    window = np.abs(lags) <= 0.1
-    # Filtered lags raw -> negative-lag peak (same convention as
-    # ekf_offline); negate for the physical delay.
-    best = float(lags[window][np.argmax(corr[window])])
-    return round(max(0.0, -best * 1000.0), 1)
+        
+    return round(float(np.median(delays)), 1)
 
 
 # ---------------------------------------------------------------------- #
@@ -228,6 +248,25 @@ def advise_filters(vibration: dict,
         notes.append("Spectrum clean and filter lag "
                      f"{'unmeasured' if delay_ms is None else f'{delay_ms:.0f} ms'} — "
                      "current low-pass settings are appropriate.")
+
+    # ---- 4) yaw torque low-pass cutoff ---------------------------------
+    if "MC_YAW_TQ_CUTOFF" in params:
+        yaw_tq_cut = float(params["MC_YAW_TQ_CUTOFF"])
+        if noisy:
+            if yaw_tq_cut > 15.0:
+                recs.append({
+                    "param": "MC_YAW_TQ_CUTOFF", "proposed_value": 15.0,
+                    "rationale": f"Spectrum is noisy — lower the yaw torque filter cutoff "
+                                 f"from {yaw_tq_cut:.1f} Hz to 15.0 Hz to prevent yaw rate loop "
+                                 f"noise from feeding back into motor torque demands.",
+                })
+        elif clean and delay_ms is not None and delay_ms > _DELAY_RAISE_MS:
+            if yaw_tq_cut < 30.0 and yaw_tq_cut > 0.0:
+                recs.append({
+                    "param": "MC_YAW_TQ_CUTOFF", "proposed_value": round(yaw_tq_cut + 5.0, 0),
+                    "rationale": f"Spectrum is clean but filter lag is {delay_ms:.0f} ms — "
+                                 f"raise the yaw torque filter cutoff to reduce phase lag in the yaw axis.",
+                })
 
     # ---- 5) accel cutoff -------------------------------------------------
     accel_rms = _accel_hf_rms(sensor)

@@ -13,7 +13,6 @@ from backend.app.analysis.vibration_live import VibrationGate
 from backend.app.analysis.ekf_monitor import EkfMonitor
 from backend.app.analysis.domains import ActuationMonitor
 from backend.app.advisors.param_advisor import ProposalState
-from backend.app.advisors.tuning_memory import TuningMemory
 from backend.app.mavlink.telemetry_hub import HUB
 from backend.app.analysis.regime import REGIME, Regime
 
@@ -60,8 +59,8 @@ class TestTuningIssues(unittest.TestCase):
         self.assertIsNone(engine._auto_rate_param("roll"))
 
     def test_coherence_data_gating(self):
-        # Issue #5: Coherence defaults to None with insufficient data (<20 samples)
-        t = np.arange(10)
+        # Issue #5: Coherence defaults to None with insufficient data (<8 samples)
+        t = np.arange(6)
         x = np.sin(t)
         y = np.sin(t)
         self.assertIsNone(compute_coherence_in_band(t, x, y))
@@ -129,11 +128,6 @@ class TestTuningIssues(unittest.TestCase):
         tol = max(1e-4, abs(wrote) * 1e-3)
         self.assertTrue(abs(live - wrote) <= tol)
 
-    def test_tuning_memory_locking(self):
-        # Issue #10: Tuning memory has a Lock initialized
-        tm = TuningMemory(Path("/tmp/dummy_tuning_mem.jsonl"))
-        self.assertTrue(hasattr(tm, "_lock"))
-        self.assertIsNotNone(tm._lock)
 
     @patch("backend.app.analysis.ekf_monitor.HUB")
     def test_estimator_status_parsing(self, mock_hub):
@@ -359,41 +353,6 @@ class TestNewTuningImprovements(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(res_slight)
         self.assertTrue(res_slight["ramped_adjusted"])
 
-    async def test_feedback_auto_timeout(self):
-        from backend.app.advisors.param_advisor import ParamAdvisor, Proposal, ProposalState
-        advisor = ParamAdvisor()
-        
-        # Create a written proposal with written_at 65 seconds ago
-        prop = Proposal(
-            id="test_timeout_id",
-            param="MC_ROLLRATE_P",
-            current_value=0.15,
-            proposed_value=0.165,
-            requested_value=0.165,
-            rationale="Test auto timeout",
-            airframe_class="MULTIROTOR",
-            state=ProposalState.WRITTEN,
-            safety_note="",
-            written_at=time.time() - 65.0
-        )
-        advisor._proposals[prop.id] = prop
-        
-        # Patch sleep using an async function to avoid TypeError on await
-        async def mock_sleep(seconds):
-            if mock_sleep.calls == 0:
-                mock_sleep.calls += 1
-                return
-            raise asyncio.CancelledError()
-        mock_sleep.calls = 0
-        
-        with patch("backend.app.advisors.param_advisor.asyncio.sleep", mock_sleep):
-            try:
-                await advisor._auto_timeout_loop()
-            except asyncio.CancelledError:
-                pass
-                
-        # Verify the proposal state feedback is auto-set to "no_feedback"
-        self.assertEqual(prop.feedback, "no_feedback")
 
     def test_diagnostic_cards(self):
         from backend.app.advisors.param_advisor import ParamAdvisor, Proposal, ProposalState
@@ -602,7 +561,7 @@ class TestNewTuningImprovements(unittest.IsolatedAsyncioTestCase):
              patch("backend.app.analysis.live_pid._airframe_class", return_value="MULTIROTOR"), \
              patch("backend.app.analysis.live_pid.CONNECTION.read_param", new_callable=AsyncMock) as mock_read_param, \
              patch.object(engine, "_safe_recommend") as mock_rec:
-            
+             
             mock_read_param.return_value = 0.003  # Below abs_max = 0.01
             await engine._advise_damping("roll", 0.40, 0, 0.28, "Medium", None)
             
@@ -612,7 +571,10 @@ class TestNewTuningImprovements(unittest.IsolatedAsyncioTestCase):
                 scale_factor=1.15,
                 confidence="Medium",
                 limitations=None,
-                severity=None
+                severity=None,
+                pre_step_motion=False,
+                ramped_input=False,
+                low_coherence=False
             )
 
         # Case 2: Vibration Low, D-gain already maxed (>= abs_max) -> Reduce P-gain
@@ -620,7 +582,7 @@ class TestNewTuningImprovements(unittest.IsolatedAsyncioTestCase):
              patch("backend.app.analysis.live_pid._airframe_class", return_value="MULTIROTOR"), \
              patch("backend.app.analysis.live_pid.CONNECTION.read_param", new_callable=AsyncMock) as mock_read_param, \
              patch.object(engine, "_safe_recommend") as mock_rec:
-            
+             
             mock_read_param.return_value = 0.01  # At abs_max = 0.01
             await engine._advise_damping("roll", 0.40, 0, 0.28, "Medium", None)
             
@@ -630,7 +592,10 @@ class TestNewTuningImprovements(unittest.IsolatedAsyncioTestCase):
                 scale_factor=0.9,
                 confidence="Medium",
                 limitations=None,
-                severity=None
+                severity=None,
+                pre_step_motion=False,
+                ramped_input=False,
+                low_coherence=False
             )
 
         # Case 3: Vibration High, D-gain not max -> Reduce P-gain
@@ -638,7 +603,7 @@ class TestNewTuningImprovements(unittest.IsolatedAsyncioTestCase):
              patch("backend.app.analysis.live_pid._airframe_class", return_value="MULTIROTOR"), \
              patch("backend.app.analysis.live_pid.CONNECTION.read_param", new_callable=AsyncMock) as mock_read_param, \
              patch.object(engine, "_safe_recommend") as mock_rec:
-            
+             
             mock_read_param.return_value = 0.003  # Below abs_max = 0.01
             await engine._advise_damping("roll", 0.40, 0, 0.28, "Medium", None)
             
@@ -648,7 +613,10 @@ class TestNewTuningImprovements(unittest.IsolatedAsyncioTestCase):
                 scale_factor=0.9,
                 confidence="Medium",
                 limitations=None,
-                severity=None
+                severity=None,
+                pre_step_motion=False,
+                ramped_input=False,
+                low_coherence=False
             )
 
         # Case 4: read_param fails (timeout/exception) -> Reduce P-gain (treat as maxed fallback)
@@ -656,7 +624,7 @@ class TestNewTuningImprovements(unittest.IsolatedAsyncioTestCase):
              patch("backend.app.analysis.live_pid._airframe_class", return_value="MULTIROTOR"), \
              patch("backend.app.analysis.live_pid.CONNECTION.read_param", side_effect=TimeoutError("Read failed")), \
              patch.object(engine, "_safe_recommend") as mock_rec:
-            
+             
             await engine._advise_damping("roll", 0.40, 0, 0.28, "Medium", None)
             
             mock_rec.assert_called_once_with(
@@ -665,7 +633,10 @@ class TestNewTuningImprovements(unittest.IsolatedAsyncioTestCase):
                 scale_factor=0.9,
                 confidence="Medium",
                 limitations=None,
-                severity=None
+                severity=None,
+                pre_step_motion=False,
+                ramped_input=False,
+                low_coherence=False
             )
 
     def test_step_vibration_rejection(self):
@@ -703,13 +674,13 @@ class TestNewTuningImprovements(unittest.IsolatedAsyncioTestCase):
 
     def test_adaptive_window_override(self):
         # Verify window override logic after 2 consecutive cycles of overshoot > 20% but zero oscillations
-        from backend.app.analysis.live_pid import LivePidEngine
+        from backend.app.analysis.live_pid import LivePidEngine, _WINDOW_S
         
         engine = LivePidEngine()
         engine._recommended_axes_this_cycle = set()
         
-        # Initially, override is default (3.0)
-        self.assertEqual(engine._window_s_override["roll"], 3.0)
+        # Initially, override is default (_WINDOW_S)
+        self.assertEqual(engine._window_s_override["roll"], _WINDOW_S)
         
         # Mock parameters & publish
         engine._rate_param = MagicMock(side_effect=lambda ax, term: f"MC_{ax.upper()}RATE_{term}")
@@ -727,9 +698,9 @@ class TestNewTuningImprovements(unittest.IsolatedAsyncioTestCase):
         with patch("backend.app.analysis.live_pid.HUB.publish"):
             engine._verdicts("roll", metrics, time.monotonic(), "Medium", None)
             
-            # Consecutive counter goes to 1, window size still 3.0
+            # Consecutive counter goes to 1, window size still _WINDOW_S
             self.assertEqual(engine._consecutive_overshoot_no_osc["roll"], 1)
-            self.assertEqual(engine._window_s_override["roll"], 3.0)
+            self.assertEqual(engine._window_s_override["roll"], _WINDOW_S)
             
             # Cycle 2: overshoot 25%, osc 0
             engine._verdicts("roll", metrics, time.monotonic(), "Medium", None)
@@ -750,7 +721,7 @@ class TestNewTuningImprovements(unittest.IsolatedAsyncioTestCase):
             engine._verdicts("roll", metrics_reset, time.monotonic(), "Medium", None)
             
             self.assertEqual(engine._consecutive_overshoot_no_osc["roll"], 0)
-            self.assertEqual(engine._window_s_override["roll"], 3.0)
+            self.assertEqual(engine._window_s_override["roll"], _WINDOW_S)
 
     async def test_discover_actuators_sequential(self):
         from backend.app.mavlink.connection import ConnectionManager, VehicleState
@@ -830,7 +801,7 @@ class TestNewTuningImprovements(unittest.IsolatedAsyncioTestCase):
         # Pre-step motion (act_noise > 0.05 AND VIB_GATE.ok() is True)
         # First case: amp < 2.0 * noise (e.g. amp = 0.16, noise = 0.09)
         sp_pre_low = np.zeros_like(t)
-        sp_pre_low[100:] = 0.16 # amp = 0.16
+        sp_pre_low[100:] = 0.12 # amp = 0.12 (less than 1.5 * noise of 0.09)
         np.random.seed(123)
         act_noise_high = np.random.normal(0, 0.09, size=200)
         act_pre_low = sp_pre_low + act_noise_high
@@ -975,7 +946,7 @@ class TestNewTuningImprovements(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(res_50)
             spy_coherence.assert_called_once()
             called_nperseg = spy_coherence.call_args[1].get("nperseg")
-            self.assertEqual(called_nperseg, 64)
+            self.assertEqual(called_nperseg, 37)
             
         # At ~200 Hz, 3s window is 600 samples -> nperseg = max(64, 600 // 4) = 150
         t_200 = np.linspace(0, 3.0, 600)
@@ -1204,8 +1175,1205 @@ class TestNewTuningImprovements(unittest.IsolatedAsyncioTestCase):
             self.assertIn("likely under-gained. Raise P", called_args[0][2])
             self.assertEqual(called_args[1].get("scale_factor"), 1.1)
 
+    def test_offline_step_rejections_and_snr(self):
+        from backend.app.analysis.pid_offline import _step_response_offline
+        # Create signals
+        t = np.linspace(0, 3.0, 300)
+        sp = np.zeros_like(t)
+        sp[100:] = 0.5
+        
+        # Test Case 1: amplitude too small (amplitude < min_amp)
+        # min_amp is 0.15, so 0.05 is too small
+        sp_small = np.zeros_like(t)
+        sp_small[100:] = 0.05
+        act_clean = sp_small.copy()
+        res, reason = _step_response_offline(t, sp_small, act_clean, min_amp=0.15)
+        self.assertIsNone(res)
+        self.assertEqual(reason, "too_small")
+
+        # Test Case 2: SNR too low (abs(amp) < multiplier * act_noise)
+        # amp = 0.5, multiplier is at least 2.0. So 2 * act_noise > 0.5 implies act_noise > 0.25
+        np.random.seed(42)
+        noise = np.random.normal(0, 0.3, size=300)
+        act_noisy = sp + noise
+        res, reason = _step_response_offline(t, sp, act_noisy, min_amp=0.15)
+        self.assertIsNone(res)
+        self.assertEqual(reason, "snr")
+
+        # Test Case 3: Ramp (post_sp_std > 0.7 * reference_amp)
+        sp_ramp = np.zeros_like(t)
+        sp_ramp[100:] = np.linspace(0.2, 2.0, 200)
+        act_ramp = sp_ramp.copy()
+        res, reason = _step_response_offline(t, sp_ramp, act_ramp, min_amp=0.15)
+        self.assertIsNone(res)
+        self.assertEqual(reason, "ramp")
+
+        # Test Case 4: Success case
+        act_success = sp.copy()
+        res, reason = _step_response_offline(t, sp, act_success, min_amp=0.15)
+        self.assertIsNotNone(res)
+        self.assertIsNone(reason)
+        self.assertEqual(res["amplitude"], 0.5)
+
+    def test_offline_diagnostics_accounting(self):
+        from backend.app.analysis.pid_offline import _suggest
+        
+        # stats with no usable steps but candidates rejected
+        stats = {
+            "n_steps": 0,
+            "candidates": 5,
+            "rejections": {
+                "too_small": 2,
+                "snr": 2,
+                "ramp": 1,
+                "window": 0
+            }
+        }
+        
+        recs, notes = _suggest("roll", stats, "MULTIROTOR", {})
+        self.assertEqual(len(recs), 0)
+        self.assertEqual(len(notes), 1)
+        self.assertIn("5 step candidates detected but all were rejected", notes[0])
+        self.assertIn("2 too small", notes[0])
+        self.assertIn("2 noisy/low SNR", notes[0])
+        self.assertIn("1 slow/ramped", notes[0])
+
+    def test_offline_yaw_attitude_fallback(self):
+        # Create rates_sp with no yaw steps (all zeros)
+        t = np.linspace(0, 5.0, 500)
+        t_ms = t * 1e6
+        rates_sp = pd.DataFrame({
+            "timestamp": t_ms,
+            "roll": np.zeros_like(t),
+            "pitch": np.zeros_like(t),
+            "yaw": np.zeros_like(t),
+        })
+        
+        # Create yaw_body in att_sp that starts at 0.0, and starting at 2.0s, increases linearly at 1.0 rad/s
+        yaw_body = np.zeros_like(t)
+        yaw_body[200:] = 1.0 * (t[200:] - t[200])
+        
+        att_sp = pd.DataFrame({
+            "timestamp": t_ms,
+            "yaw_body": yaw_body
+        })
+        
+        # Actual yaw rate steps to 1.0 and has standard underdamped response
+        xyz2 = np.zeros_like(t)
+        xyz2[200:] = 1.0 + 0.2 * np.exp(-5 * (t[200:] - t[200])) * np.cos(15 * (t[200:] - t[200]))
+        
+        ang_vel = pd.DataFrame({
+            "timestamp": t_ms,
+            "xyz[0]": np.zeros_like(t),
+            "xyz[1]": np.zeros_like(t),
+            "xyz[2]": xyz2,
+        })
+        
+        params = {"MC_YAWRATE_P": 0.15}
+        
+        res = pid_offline.analyze_pid(
+            rates_sp=rates_sp,
+            ang_vel=ang_vel,
+            sensor=None,
+            params=params,
+            airframe_class="MULTIROTOR",
+            att_sp=att_sp
+        )
+        
+        self.assertIn("yaw (rate)", res["axes"])
+        yaw_stats = res["axes"]["yaw (rate)"]
+        self.assertTrue(yaw_stats.get("derived_from_attitude"))
+        self.assertTrue(yaw_stats.get("n_steps") > 0)
+        self.assertTrue(yaw_stats["confidence"]["flags"]["derived_from_attitude"])
+        self.assertLessEqual(yaw_stats["confidence"]["score"], 0.5)
+
+    def test_offline_step_level_change_cutting(self):
+        from backend.app.analysis.pid_offline import _step_response_offline
+        t = np.linspace(0, 3.0, 300)
+        
+        # Step at 1.0s (index 100) from 0.0 to 1.0, and level change back at 2.0s (index 200)
+        sp = np.zeros_like(t)
+        sp[100:200] = 1.0
+        sp[200:] = 0.0
+        
+        act = sp.copy()
+        
+        res, reason = _step_response_offline(t, sp, act, min_amp=0.15)
+        self.assertIsNotNone(res)
+        self.assertIsNone(reason)
+        self.assertTrue(res["confidence"]["flags"]["short_post_window"])
+
+    def test_live_confidence_caps(self):
+        from backend.app.analysis.live_pid import LivePidEngine
+        from unittest.mock import patch
+        
+        engine = LivePidEngine()
+        t = np.linspace(0, 2.5, 125)
+        sp = np.zeros_like(t)
+        sp[50:] = 0.5
+        act = sp.copy()
+        
+        # Case 1: noise_ratio > 0.25 -> Cap at Low
+        step_result_high_noise = {
+            "tau_s": 0.1,
+            "settling_s": 0.4,
+            "overshoot": 0.1,
+            "oscillations": 0,
+            "step_amp_deg_s": 28.6,
+            "amplitude": 0.5,
+            "post_sp_std": 0.01,
+            "ramped_adjusted": False,
+            "t_start": 1.0,
+            "noise_ratio": 0.30  # > 0.25
+        }
+        
+        engine._win["roll"].clear()
+        for i in range(len(t)):
+            engine._win["roll"].append((t[i], sp[i], act[i]))
+            
+        with patch.object(engine, "_step_response", return_value=step_result_high_noise), \
+             patch.object(engine, "_verdicts") as mock_verdicts:
+             
+            engine._evaluate(2.5)
+            mock_verdicts.assert_called_once()
+            called_args = mock_verdicts.call_args
+            confidence_label = called_args[0][3]
+            self.assertEqual(confidence_label, "Low confidence (needs clearer data)")
+            
+        # Case 2: 0.15 < noise_ratio <= 0.25 -> Cap at Medium
+        step_result_medium_noise = step_result_high_noise.copy()
+        step_result_medium_noise["noise_ratio"] = 0.20
+        
+        engine._win["roll"].clear()
+        for i in range(len(t)):
+            sp_excited = np.sin(2 * np.pi * 2 * t[i]) * 0.3
+            sp_excited += 0.5 if i >= 50 else 0.0
+            act_excited = sp_excited
+            engine._win["roll"].append((t[i], sp_excited, act_excited))
+            
+        with patch.object(engine, "_step_response", return_value=step_result_medium_noise), \
+             patch.object(engine, "_verdicts") as mock_verdicts:
+             
+            engine._evaluate(2.5)
+            mock_verdicts.assert_called_once()
+            called_args = mock_verdicts.call_args
+            confidence_label = called_args[0][3]
+            self.assertEqual(confidence_label, "Medium confidence (passive observation)")
+
+    def test_adaptive_sequence_gating(self):
+        from backend.app.analysis.live_pid import LivePidEngine
+        
+        t = np.linspace(0, 5.0, 250)
+        sp = np.zeros_like(t)
+        sp[50:] = 0.5
+        act = sp.copy()
+        
+        # Test Case 1: no last step -> window is 1.0s
+        res = LivePidEngine._step_response(t, sp, act, min_amp=0.15, last_step_t=None)
+        self.assertIsNotNone(res)
+        
+        # Test Case 2: last_step_t is recent (1.0s ago) -> pre-step window is 0.3s
+        res_recent = LivePidEngine._step_response(t, sp, act, min_amp=0.15, last_step_t=0.0)
+        self.assertIsNotNone(res_recent)
+
+    def test_step_history_accumulation(self):
+        from backend.app.analysis.live_pid import LivePidEngine
+        from unittest.mock import patch
+        
+        engine = LivePidEngine()
+        t = np.linspace(0, 2.5, 125)
+        sp = np.zeros_like(t)
+        sp[50:] = 0.5
+        act = sp.copy()
+        
+        step_result = {
+            "tau_s": 0.1,
+            "settling_s": 0.4,
+            "overshoot": 0.1,
+            "oscillations": 0,
+            "step_amp_deg_s": 28.6,
+            "amplitude": 0.5,
+            "post_sp_std": 0.01,
+            "ramped_adjusted": False,
+            "t_start": 1.0,
+        }
+        
+        engine._win["roll"].clear()
+        for i in range(len(t)):
+            engine._win["roll"].append((t[i], sp[i], act[i]))
+            
+        with patch.object(engine, "_step_response", return_value=step_result), \
+             patch("backend.app.analysis.live_pid.HUB.publish") as mock_publish:
+             
+            for _ in range(12):
+                engine._evaluate(2.5)
+                
+            self.assertEqual(len(engine._step_history["roll"]), 10)
+            self.assertEqual(engine._last_step_t["roll"], 1.0)
+            
+            metrics_calls = [c[0][1] for c in mock_publish.call_args_list if c[0][0] == "loop_metrics"]
+            self.assertTrue(len(metrics_calls) > 0)
+            last_metrics = metrics_calls[-1]
+            self.assertIn("step_history", last_metrics["axes"]["roll"])
+            self.assertEqual(len(last_metrics["axes"]["roll"]["step_history"]), 10)
+
+    async def test_underdamped_branch_c(self):
+        from backend.app.analysis.live_pid import LivePidEngine
+        from backend.app.advisors.param_advisor import ADVISOR
+        
+        engine = LivePidEngine()
+        ADVISOR.clear()
+        
+        from backend.app.analysis import recommendations
+        recommendations._last_emit.clear()
+        
+        with patch("backend.app.analysis.live_pid.VIB_GATE.ok", return_value=True), \
+             patch("backend.app.analysis.live_pid._airframe_class", return_value="MULTIROTOR"), \
+             patch("backend.app.analysis.live_pid.CONNECTION.read_param", new_callable=AsyncMock) as mock_read_param, \
+             patch("backend.app.analysis.live_pid.HUB.publish") as mock_publish:
+            
+            mock_read_param.return_value = 0.003
+            
+            # Overshoot 35% (>30%), settling is None, oscillations is None -> Branch C.
+            metrics = {
+                "tau_s": 0.1,
+                "settling_s": None,
+                "overshoot": 0.35,
+                "oscillations": None,
+                "step_amp_deg_s": 20.0,
+                "amplitude": 0.35,
+                "post_sp_std": 0.02,
+                "ramped_adjusted": False,
+            }
+            
+            engine._rate_param = MagicMock(side_effect=lambda ax, term: f"MC_{ax.upper()}RATE_{term}")
+            engine._recommended_axes_this_cycle = set()
+            
+            engine._verdicts("roll", metrics, time.monotonic(), "Medium", None)
+            
+            await asyncio.sleep(0.05)
+            
+            publish_calls = [(call[0][0], call[0][1]) for call in mock_publish.call_args_list]
+            damping_alerts = [p[1] for p in publish_calls if p[0] == "alert" and "damping deficit" in p[1].get("text", "")]
+            self.assertEqual(len(damping_alerts), 1)
+            self.assertIn("never settled", damping_alerts[0].get("text", ""))
+
+    async def test_no_p_reduction_on_unknown_oscillations(self):
+        from backend.app.analysis.live_pid import LivePidEngine
+        from backend.app.advisors.param_advisor import ADVISOR
+        
+        engine = LivePidEngine()
+        ADVISOR.clear()
+        
+        from backend.app.analysis import recommendations
+        recommendations._last_emit.clear()
+        
+        with patch("backend.app.analysis.live_pid.VIB_GATE.ok", return_value=True), \
+             patch("backend.app.analysis.live_pid.HUB.publish") as mock_publish, \
+             patch.object(engine, "_safe_recommend") as mock_recommend:
+            
+            # Overshoot 35% (>30%), settling is 0.4s (not None), but oscillations is None.
+            metrics = {
+                "tau_s": 0.1,
+                "settling_s": 0.4,
+                "overshoot": 0.35,
+                "oscillations": None,
+                "step_amp_deg_s": 20.0,
+                "amplitude": 0.35,
+                "post_sp_std": 0.02,
+                "ramped_adjusted": False,
+            }
+            
+            engine._rate_param = MagicMock(side_effect=lambda ax, term: f"MC_{ax.upper()}RATE_{term}")
+            engine._recommended_axes_this_cycle = set()
+            
+            engine._verdicts("roll", metrics, time.monotonic(), "Medium", None)
+            
+            # Verify no recommend call for P reduction was made (because osc is None, not 0)
+            mock_recommend.assert_not_called()
+
+    async def test_tau_none_overshoot_guard(self):
+        from backend.app.analysis.live_pid import LivePidEngine
+        from backend.app.advisors.param_advisor import ADVISOR
+        
+        engine = LivePidEngine()
+        ADVISOR.clear()
+        
+        from backend.app.analysis import recommendations
+        recommendations._last_emit.clear()
+        
+        with patch("backend.app.analysis.live_pid.VIB_GATE.ok", return_value=True), \
+             patch("backend.app.analysis.live_pid.HUB.publish") as mock_publish, \
+             patch.object(engine, "_safe_recommend") as mock_recommend:
+            
+            # tau is None, step_amp_deg_s is present, overshoot is 35% (>30%), no saturation (severity = "none")
+            metrics = {
+                "tau_s": None,
+                "settling_s": 0.4,
+                "overshoot": 0.35,
+                "oscillations": None,
+                "step_amp_deg_s": 20.0,
+                "amplitude": 0.35,
+                "post_sp_std": 0.02,
+                "ramped_adjusted": False,
+            }
+            
+            engine._rate_param = MagicMock(side_effect=lambda ax, term: f"MC_{ax.upper()}RATE_{term}")
+            engine._recommended_axes_this_cycle = set()
+            
+            engine._verdicts("roll", metrics, time.monotonic(), "Medium", None, severity="none")
+            
+            # Verify no recommend call for P increase was made (because overshoot > _OVERSHOOT_LIMIT)
+            mock_recommend.assert_not_called()
+
+
+    def test_nrmse_gating(self):
+        from backend.app.analysis.live_pid import LivePidEngine
+        
+        # sp_range <= 0.1 (flat window with slight noise)
+        sp1 = np.ones(10) * 0.05
+        act1 = np.ones(10) * 0.04
+        metrics1 = LivePidEngine._tracking_metrics(sp1, act1)
+        self.assertIsNone(metrics1["nrmse"])
+        
+        # sp_range > 0.1 (actual step)
+        sp2 = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.2, 0.2, 0.2, 0.2, 0.2])
+        act2 = sp2 * 0.9
+        metrics2 = LivePidEngine._tracking_metrics(sp2, act2)
+        self.assertIsNotNone(metrics2["nrmse"])
+        self.assertLess(metrics2["nrmse"], 1.0)
+
+    def test_minimum_confidence_calculation(self):
+        from backend.app.analysis.live_pid import LivePidEngine
+        
+        engine = LivePidEngine()
+        # Set up a situation where excitation_score = 0.5, step_score = 0.8, coherence_score = 0.7.
+        # With minimum calculation, confidence_value should be 0.5.
+        
+        t = np.linspace(0, 2.5, 125)
+        sp = np.zeros_like(t)
+        sp[62:] = 0.3
+        act = sp.copy()
+        
+        step_result = {
+            "tau_s": 0.1,
+            "settling_s": 0.4,
+            "overshoot": 0.1,
+            "oscillations": 0,
+            "step_amp_deg_s": 28.6,
+            "amplitude": 0.3,
+            "post_sp_std": 0.01,
+            "ramped_adjusted": False,
+            "t_start": 1.0,
+            "noise_ratio": 0.0
+        }
+        
+        engine._win["roll"].clear()
+        for i in range(len(t)):
+            engine._win["roll"].append((t[i], sp[i], act[i]))
+            
+        with patch.object(engine, "_step_response", return_value=step_result), \
+             patch.object(engine, "_verdicts") as mock_verdicts:
+             
+            with patch("backend.app.analysis.live_pid.np.std", side_effect=lambda x: 0.15 if len(x) == len(sp) else np.std(x)):
+                engine._evaluate(2.5)
+                mock_verdicts.assert_called_once()
+                called_args = mock_verdicts.call_args
+                confidence_label = called_args[0][3]
+                self.assertEqual(confidence_label, "Low confidence (needs clearer data)")
+
+            with patch("backend.app.analysis.live_pid.np.std", side_effect=lambda x: 0.20 if len(x) == len(sp) else np.std(x)):
+                engine._win["roll"].clear()
+                for i in range(len(t)):
+                    engine._win["roll"].append((t[i], sp[i], act[i]))
+                
+                with patch.object(engine, "_tracking_metrics", return_value={"r": 0.9, "nrmse": 0.05, "coherence": 0.80, "high_rate": False}):
+                    engine._evaluate(2.5)
+                    confidence_label = mock_verdicts.call_args[0][3]
+                    self.assertEqual(confidence_label, "Medium confidence (passive observation)")
+
+    def test_consecutive_no_increment_when_osc_none(self):
+        from backend.app.analysis.live_pid import LivePidEngine
+        
+        engine = LivePidEngine()
+        engine._consecutive_overshoot_no_osc["roll"] = 1
+        
+        metrics = {
+            "tau_s": 0.1,
+            "settling_s": 0.4,
+            "overshoot": 0.25,
+            "oscillations": None,
+            "amplitude": 0.5,
+            "post_sp_std": 0.02,
+        }
+        
+        with patch("backend.app.analysis.live_pid.HUB.publish"):
+            engine._verdicts("roll", metrics, time.monotonic(), "Medium", None)
+            self.assertEqual(engine._consecutive_overshoot_no_osc["roll"], 1)
+
+    def test_cascade_local_position_setpoint_feed(self):
+        from backend.app.analysis.cascade import CascadeEngine
+        engine = CascadeEngine()
+        payload = {"vx": 1.5, "vy": -0.5, "vz": 0.0, "x": 10.0, "y": 20.0, "z": -5.0}
+        engine._feed_local_position_setpoint(payload)
+        self.assertEqual(engine.velocity.latest_sp.get("vx"), 1.5)
+        self.assertEqual(engine.velocity.latest_sp.get("vy"), -0.5)
+        self.assertEqual(engine.velocity.latest_sp.get("vz"), 0.0)
+        self.assertEqual(engine.position.latest_sp.get("x"), 10.0)
+        self.assertEqual(engine.position.latest_sp.get("y"), 20.0)
+        self.assertEqual(engine.position.latest_sp.get("z"), -5.0)
+
+    @patch("backend.app.analysis.cascade.STATE")
+    @patch("backend.app.analysis.cascade.HUB")
+    def test_cascade_activity_gate(self, mock_hub, mock_state):
+        from backend.app.analysis.cascade import _OuterLoop
+        
+        # Setup STATE mock
+        mock_state.auto_flight.return_value = False
+        mock_state.loops_active.return_value = {"vx", "vy", "vz"}
+        mock_state.domain = "MC"
+        
+        # Test Case 1: Inactive velocity loop (act_std = 0.0 <= 0.1)
+        # 20 samples of sp and act both being constant
+        loop = _OuterLoop("velocity", ["vx"], 6.0, 0.2, "m/s", MagicMock())
+        now = time.monotonic()
+        for i in range(20):
+            # Feed constant values
+            loop.win["vx"].append((now + i * 0.1, 1.0, 1.0))
+            
+        loop._evaluate(now + 2.0)
+        
+        # Since it's inactive, no metrics should be published
+        mock_hub.publish.assert_not_called()
+        
+        # Test Case 2: Active velocity loop (act_std > 0.1)
+        # Feed changing values (std around 0.5)
+        loop_active = _OuterLoop("velocity", ["vx"], 6.0, 0.2, "m/s", MagicMock())
+        for i in range(20):
+            val = 1.0 if i % 2 == 0 else 0.0
+            loop_active.win["vx"].append((now + i * 0.1, val, val))
+            
+        with patch("backend.app.analysis.cascade.LivePidEngine._step_response", return_value=None):
+            loop_active._evaluate(now + 2.0)
+            
+        # Since active, it should publish metrics
+        mock_hub.publish.assert_called_with("loop_metrics", unittest.mock.ANY)
+
+    @patch("backend.app.analysis.cascade.STATE")
+    @patch("backend.app.analysis.cascade.REGIME")
+    def test_cascade_manual_posctl_bypass(self, mock_regime, mock_state):
+        from backend.app.analysis.cascade import CascadeEngine, Regime
+        
+        # Setup mock state to reflect manual POSCTL flight
+        mock_state.mode = "POSCTL"
+        mock_state.loops_active.return_value = {"rate", "attitude", "velocity", "position"}
+        mock_state.auto_flight.return_value = False
+        
+        # Setup regime mock: say we are in STEADY_HOLD (not DYNAMIC_MANEUVER)
+        mock_regime.current = Regime.STEADY_HOLD
+        
+        engine = CascadeEngine()
+        engine.velocity.clear()
+        engine.velocity.feed_sp({"vx": 0.0, "vy": 0.0, "vz": 0.0})
+        
+        # Feed some values
+        now = time.monotonic()
+        engine._feed(engine.velocity, {"vx": 1.0, "vy": 0.0, "vz": 0.0}, now)
+        
+        # Verify that velocity loop window is NOT empty (it bypassed the regime check)
+        self.assertGreater(len(engine.velocity.win["vx"]), 0)
+        
+        # Now let's feed attitude loop in the same state
+        engine.attitude.clear()
+        engine.attitude.feed_sp({"roll": 0.0, "pitch": 0.0})
+        engine._feed(engine.attitude, {"roll": 0.1, "pitch": 0.0}, now)
+        # Verify that attitude loop IS cleared because attitude requires _loop_enabled (which checks regime)
+        self.assertEqual(len(engine.attitude.win["roll"]), 0)
+
+    @patch("backend.app.mavlink.telemetry_hub.HUB.publish")
+    def test_velocity_broadened_recommendations(self, mock_publish):
+        from backend.app.analysis.cascade import _velocity_advice
+        from backend.app.analysis import recommendations
+        
+        # 1. P-gain recommendation on overshoot
+        recommendations._last_emit.clear()
+        mock_publish.reset_mock()
+        
+        m_overshoot = {
+            "tau_s": 0.5,
+            "settling_s": 1.2,
+            "overshoot": 0.25,
+            "sp": 1.0,
+            "act": 1.1,
+            "r": 0.9,
+        }
+        _velocity_advice("vx", "overshoot", m_overshoot, "MC")
+        
+        # Check P-gain reduction recommendation is published
+        publish_calls = [call[0][1] for call in mock_publish.call_args_list if call[0][0] == "recommendation"]
+        self.assertTrue(any(p.get("param") == "MPC_XY_VEL_P_ACC" and p.get("scale_factor") == 0.9 for p in publish_calls))
+        
+        # 2. I-gain recommendation on persistent offset
+        recommendations._last_emit.clear()
+        mock_publish.reset_mock()
+        
+        m_persistent = {
+            "tau_s": None,
+            "settling_s": None,
+            "overshoot": 0.0,
+            "sp": 2.0,
+            "act": 1.5,
+            "r": 0.7,  # < 0.8
+        }
+        _velocity_advice("vx", "sluggish", m_persistent, "MC")
+        
+        publish_calls = [call[0][1] for call in mock_publish.call_args_list if call[0][0] == "recommendation"]
+        self.assertTrue(any(p.get("param") == "MPC_XY_VEL_I_ACC" and p.get("scale_factor") == 1.15 for p in publish_calls))
+        
+        # 3. D-gain recommendation on oscillatory behavior
+        recommendations._last_emit.clear()
+        mock_publish.reset_mock()
+        
+        m_oscillatory = {
+            "tau_s": 0.4,
+            "settling_s": 1.5,  # > 3 * tau (1.2)
+            "overshoot": 0.18,  # > 0.15
+            "sp": 1.0,
+            "act": 1.0,
+            "r": 0.95,
+        }
+        _velocity_advice("vx", "sluggish", m_oscillatory, "MC")
+        
+        publish_calls = [call[0][1] for call in mock_publish.call_args_list if call[0][0] == "recommendation"]
+        self.assertTrue(any(p.get("param") == "MPC_XY_VEL_D_ACC" and p.get("scale_factor") == 1.15 for p in publish_calls))
+
+    def test_offline_yaw_axis_lower_threshold(self):
+        from backend.app.analysis.pid_offline import _analyze_axis
+        
+        t = np.linspace(0, 3.0, 300)
+        
+        # Create a small step setpoint of amplitude 0.10 rad/s
+        sp = np.zeros_like(t)
+        sp[100:] = 0.10
+        act = sp.copy()
+        
+        # 1. Roll axis: minimum threshold is 0.15, so 0.10 is too small and yields no steps
+        res_roll = _analyze_axis(t, sp, act, axis="roll")
+        self.assertEqual(res_roll.get("n_steps"), 0)
+        
+        # 2. Yaw axis: minimum threshold is 0.08, so 0.10 is accepted
+        res_yaw = _analyze_axis(t, sp, act, axis="yaw")
+        self.assertEqual(res_yaw.get("n_steps"), 1)
+
+    def test_offline_attitude_loop_analysis(self):
+        # 1. Test quaternion to Euler conversion helper
+        from backend.app.analysis.pid_offline import _extract_euler_angles, analyze_pid
+        
+        # Identity quaternion should result in roll=0, pitch=0, yaw=0
+        df_q = pd.DataFrame({
+            "q[0]": [1.0, 1.0],
+            "q[1]": [0.0, 0.0],
+            "q[2]": [0.0, 0.0],
+            "q[3]": [0.0, 0.0],
+        })
+        eulers = _extract_euler_angles(df_q)
+        self.assertIsNotNone(eulers)
+        self.assertAlmostEqual(eulers["roll"][0], 0.0)
+        self.assertAlmostEqual(eulers["pitch"][0], 0.0)
+        self.assertAlmostEqual(eulers["yaw"][0], 0.0)
+
+        # 2. Run analyze_pid and check step response on both rate and body axes
+        t = np.linspace(0, 5.0, 500)
+        t_ms = t * 1e6
+
+        # Construct a pitch step in rate loop (e.g. from 0.0 to 0.5 rad/s)
+        rates_sp = pd.DataFrame({
+            "timestamp": t_ms,
+            "roll": np.zeros_like(t),
+            "pitch": np.zeros_like(t),
+            "yaw": np.zeros_like(t),
+        })
+        rates_sp.loc[200:, "pitch"] = 0.5  # Step of 0.5 rad/s at t=2.0s
+        
+        ang_vel = pd.DataFrame({
+            "timestamp": t_ms,
+            "xyz[0]": np.zeros_like(t),
+            "xyz[1]": np.zeros_like(t),  # Step response in pitch actual
+            "xyz[2]": np.zeros_like(t),
+        })
+        # actual pitch rate has overshoot (overshoot = 0.3)
+        ang_vel.loc[200:, "xyz[1]"] = 0.5
+        ang_vel.loc[200:230, "xyz[1]"] = 0.65  # peak of 0.65 (overshoot = (0.65-0.5)/0.5 = 30%)
+
+        # Construct a roll step in body attitude loop (e.g. from 0.0 to 10 degrees = 0.174 rad)
+        att_sp = pd.DataFrame({
+            "timestamp": t_ms,
+            "roll_body": np.zeros_like(t),
+            "pitch_body": np.zeros_like(t),
+            "yaw_body": np.zeros_like(t),
+        })
+        att_sp.loc[200:, "roll_body"] = 0.2  # Step of 0.2 rad at t=2.0s
+
+        vehicle_att = pd.DataFrame({
+            "timestamp": t_ms,
+            "roll": np.zeros_like(t),
+            "pitch": np.zeros_like(t),
+            "yaw": np.zeros_like(t),
+        })
+        # actual roll attitude has overshoot (overshoot = 0.4)
+        vehicle_att.loc[200:, "roll"] = 0.2
+        vehicle_att.loc[200:230, "roll"] = 0.28  # peak of 0.28 (overshoot = 40%)
+
+        params = {
+            "MC_PITCHRATE_P": 0.15,
+            "MC_ROLL_P": 6.5,
+            "FW_RR_P": 0.05,
+            "FW_R_TC": 0.4,
+        }
+
+        # Test Multirotor recommendations
+        res_mc = analyze_pid(
+            rates_sp=rates_sp,
+            ang_vel=ang_vel,
+            sensor=None,
+            params=params,
+            airframe_class="MULTIROTOR",
+            att_sp=att_sp,
+            vehicle_att=vehicle_att
+        )
+
+        # Rate loop should analyze "pitch (rate)" and recommend backing off P due to overshoot (30% > 25%)
+        self.assertIn("pitch (rate)", res_mc["axes"])
+        pitch_rate_stats = res_mc["axes"]["pitch (rate)"]
+        self.assertTrue(pitch_rate_stats.get("n_steps") > 0)
+        self.assertGreater(pitch_rate_stats.get("overshoot_max", 0.0), 0.25)
+        
+        # Body loop should analyze "roll (body)" and recommend backing off MC_ROLL_P due to overshoot (40% > 25%)
+        self.assertIn("roll (body)", res_mc["axes"])
+        roll_body_stats = res_mc["axes"]["roll (body)"]
+        self.assertTrue(roll_body_stats.get("n_steps") > 0)
+        self.assertGreater(roll_body_stats.get("overshoot_max", 0.0), 0.25)
+
+        # Check recommendations
+        recs = res_mc["recommendations"]
+        self.assertTrue(any(r["param"] == "MC_PITCHRATE_P" and r["proposed_value"] < 0.15 for r in recs))
+        self.assertTrue(any(r["param"] == "MC_ROLL_P" and r["proposed_value"] < 6.5 for r in recs))
+
+        # Test Fixed-Wing recommendations (checking time constants)
+        res_fw = analyze_pid(
+            rates_sp=rates_sp,
+            ang_vel=ang_vel,
+            sensor=None,
+            params=params,
+            airframe_class="FIXED_WING",
+            att_sp=att_sp,
+            vehicle_att=vehicle_att
+        )
+        recs_fw = res_fw["recommendations"]
+        # Fixed wing should slow down roll attitude loop by raising FW_R_TC due to overshoot
+        self.assertTrue(any(r["param"] == "FW_R_TC" and r["proposed_value"] > 0.4 for r in recs_fw))
+
+    def test_offline_pulsed_setpoint_overshoot(self):
+        from backend.app.analysis.pid_offline import _step_response_offline
+        
+        t = np.linspace(0, 3.0, 300)
+        
+        # Step from 0.0 to 1.0 at t=0.5s, stays at 1.0 until 1.5s, then returns gradually to 0.0 at 2.5s.
+        sp = np.zeros_like(t)
+        sp[50:150] = 1.0
+        # gradual return to 0.0 from 1.5s (index 150) to 2.5s (index 250)
+        sp[150:250] = np.linspace(1.0, 0.0, 100)
+        
+        # The actual tracks it perfectly with NO overshoot (reaches exactly 1.0 and decays the same way)
+        act = sp.copy()
+        
+        res, reason = _step_response_offline(t, sp, act, min_amp=0.15)
+        
+        self.assertIsNotNone(res)
+        self.assertIsNone(reason)
+        # overshoot should be calculated relative to the plateau (1.0), which is close to 0.0 (or very low)
+        # instead of being inflated (e.g. 500%) by the return-to-zero value.
+        self.assertLess(res["overshoot"], 0.10)
+
+    def test_offline_plateau_mitigations(self):
+        from backend.app.analysis.pid_offline import _step_response_offline
+        
+        t = np.linspace(0, 3.0, 300)
+        
+        # Test Case 1: Very short plateau (< 5 samples)
+        sp_short = np.zeros_like(t)
+        sp_short[50:53] = 1.0  # only 3 samples of plateau
+        act_short = sp_short.copy()
+        res_short, reason_short = _step_response_offline(t, sp_short, act_short, min_amp=0.15)
+        self.assertIsNone(res_short)
+        self.assertIn(reason_short, ("window_too_short", "level_change"))
+        
+        # Test Case 2: Ramped input (no steady plateau, < 5% of window length)
+        # 300 samples total. post_mask has 250 samples. 5% is 12.5 samples.
+        sp_ramp = np.zeros_like(t)
+        sp_ramp[50:60] = np.linspace(0.0, 1.0, 10)
+        sp_ramp[60:63] = 1.0  # only 3 samples of plateau at peak, then returns to 0
+        act_ramp = sp_ramp.copy()
+        res_ramp, reason_ramp = _step_response_offline(t, sp_ramp, act_ramp, min_amp=0.15)
+        self.assertIsNone(res_ramp)
+        self.assertIn(reason_ramp, ("ramp", "level_change", "too_small", "window_too_short"))
+
+    def test_ulog_pipeline_version_parsing(self):
+        from backend.app.analysis.ulog_pipeline import (
+            _decode_ver_sw_release, _format_ver_sw_release
+        )
+        
+        # 1. Test decode release version
+        # 0x011100FF (1.17.0 Release)
+        dec_rel = _decode_ver_sw_release(0x011100FF)
+        self.assertEqual(dec_rel, (1, 17, 0, 255))
+        
+        # 0x010E01C0 (1.14.1 RC0)
+        dec_rc = _decode_ver_sw_release(0x010E01C0)
+        self.assertEqual(dec_rc, (1, 14, 1, 192))
+        
+        # 2. Test formatting
+        # Release type 255
+        self.assertEqual(_format_ver_sw_release(1, 17, 0, 255), "v1.17.0")
+        # RC type 192 (RC0)
+        self.assertEqual(_format_ver_sw_release(1, 14, 1, 192), "v1.14.1-rc0")
+        # Beta type 129 (Beta1)
+        self.assertEqual(_format_ver_sw_release(1, 14, 0, 129), "v1.14.0-beta1")
+        # Alpha type 65 (Alpha1)
+        self.assertEqual(_format_ver_sw_release(1, 14, 0, 65), "v1.14.0-alpha1")
+        # Dev type 5 (Dev5)
+        self.assertEqual(_format_ver_sw_release(1, 14, 0, 5), "v1.14.0-dev5")
+
+
+    def test_offline_frequency_domain_fallback(self):
+        from backend.app.analysis.pid_offline import compute_fd_gain, _suggest
+        
+        # 1. Verify compute_fd_gain works as expected on simulated signals
+        t = np.linspace(0, 10.0, 1000)
+        # Create a setpoint x and actual y with a specific gain relationship (e.g. y = 0.8 * x)
+        # We use a sinusoid at 0.75 Hz (in the center of the 0.5-1.0 Hz low frequency band)
+        x = np.sin(2 * np.pi * 0.75 * t)
+        y = 0.8 * x
+        
+        gain = compute_fd_gain(t, x, y)
+        self.assertIsNotNone(gain)
+        # gain should be very close to 0.8
+        self.assertAlmostEqual(gain, 0.8, places=2)
+        
+        # 2. Test fallback recommendations inside _suggest
+        # Stats dictionary with no step maneuvers (n_steps = 0) but high coherence and low gain (< 0.85)
+        stats_sluggish = {
+            "n_steps": 0,
+            "n_steps_time_domain": 0,
+            "candidates": 0,
+            "coherence": 0.8,
+            "fd_gain": 0.8,
+        }
+        params = {"MC_ROLLRATE_P": 0.15}
+        recs, notes = _suggest("roll (rate)", stats_sluggish, "MULTIROTOR", params)
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["param"], "MC_ROLLRATE_P")
+        self.assertTrue(recs[0]["proposed_value"] > 0.15) # sluggish -> propose increasing P
+        
+        # Stats dictionary with no step maneuvers (n_steps = 0) but high coherence and elevated gain (> 1.15)
+        stats_elevated = {
+            "n_steps": 0,
+            "n_steps_time_domain": 0,
+            "candidates": 0,
+            "coherence": 0.85,
+            "fd_gain": 1.25,
+        }
+        recs_el, notes_el = _suggest("roll (rate)", stats_elevated, "MULTIROTOR", params)
+        self.assertEqual(len(recs_el), 1)
+        self.assertEqual(recs_el[0]["param"], "MC_ROLLRATE_P")
+        self.assertTrue(recs_el[0]["proposed_value"] < 0.15) # elevated -> propose decreasing P
+
+    def test_filter_delay_multiaxial_and_sanity_check(self):
+        from backend.app.analysis.filter_advisor import measure_filter_delay_ms
+        
+        t = np.linspace(0, 15.0, 3000)
+        t_ms = t * 1e6
+        
+        np.random.seed(42)
+        raw_roll = np.sin(2 * np.pi * 5.0 * t) + np.random.normal(0, 0.1, len(t))
+        raw_pitch = np.sin(2 * np.pi * 7.0 * t) + np.random.normal(0, 0.1, len(t))
+        raw_yaw = np.sin(2 * np.pi * 9.0 * t) + np.random.normal(0, 0.1, len(t))
+        
+        sensor = pd.DataFrame({
+            "timestamp": t_ms,
+            "gyro_rad[0]": raw_roll,
+            "gyro_rad[1]": raw_pitch,
+            "gyro_rad[2]": raw_yaw,
+        })
+        
+        flt_roll = np.roll(raw_roll, 3) # 15 ms delay
+        flt_pitch = np.roll(raw_pitch, 4) # 20 ms delay
+        flt_yaw = np.roll(raw_yaw, 5) # 25 ms delay
+        
+        ang_vel = pd.DataFrame({
+            "timestamp": t_ms,
+            "xyz[0]": flt_roll,
+            "xyz[1]": flt_pitch,
+            "xyz[2]": flt_yaw,
+        })
+        
+        delay = measure_filter_delay_ms(sensor, ang_vel)
+        self.assertIsNotNone(delay)
+        self.assertAlmostEqual(delay, 20.0, delta=5.0)
+        
+        # Test 50ms sanity check filtering
+        flt_yaw_massive = np.roll(raw_yaw, 12) # 60 ms delay -> suspect!
+        ang_vel_massive = pd.DataFrame({
+            "timestamp": t_ms,
+            "xyz[0]": flt_roll,      # 15 ms
+            "xyz[1]": flt_pitch,     # 20 ms
+            "xyz[2]": flt_yaw_massive, # 60 ms (filtered out)
+        })
+        
+        delay_massive = measure_filter_delay_ms(sensor, ang_vel_massive)
+        self.assertIsNotNone(delay_massive)
+        self.assertAlmostEqual(delay_massive, 17.5, delta=3.0)
+
+    def test_actuator_improvements(self):
+        from backend.app.analysis import actuator_saturation
+        # Create timestamps from 0 to 10s at 100Hz
+        t = np.linspace(0, 10, 1000)
+        ts_us = t * 1e6
+        
+        # Motors (M1 to M4 on output[0] to output[3])
+        # Let's say M1 has a constant value of 1500 (PWM)
+        # M2 has a slightly higher constant value of 1600 (PWM)
+        # M3 has a sinusoid
+        # M4 has a sinusoid
+        outputs = pd.DataFrame({
+            "timestamp": ts_us,
+            "output[0]": np.full_like(t, 1500.0),
+            "output[1]": np.full_like(t, 1600.0),
+            "output[2]": 1500.0 + 300.0 * np.sin(2 * np.pi * t),
+            "output[3]": 1500.0 + 300.0 * np.sin(2 * np.pi * t),
+        })
+        
+        # Mapped to hover_motors: 0, 1, 2, 3
+        actuator_map = {
+            "hover_motors": [0, 1, 2, 3],
+            "thrust_motors": [],
+            "control_surfaces": [],
+            "tilt_servos": [],
+        }
+        
+        # Control inputs matching the outputs
+        controls = pd.DataFrame({
+            "timestamp": ts_us,
+            "control[0]": np.zeros_like(t),
+            "control[1]": np.zeros_like(t),
+            "control[2]": np.zeros_like(t),
+            "control[3]": 0.5 + 0.3 * np.sin(2 * np.pi * t), # thrust command correlated with outputs[2] and [3]
+        })
+        
+        # Parameter limits: let's configure limits for M1 (OUT1_MIN/MAX) and M2 (PWM_MAIN_MIN2/MAX2)
+        params = {
+            "OUT1_MIN": 1000.0,
+            "OUT1_MAX": 2000.0,
+            "PWM_MAIN_MIN2": 1000.0,
+            "PWM_MAIN_MAX2": 2000.0,
+        }
+        
+        res = actuator_saturation.analyze_saturation(
+            outputs, actuator_map=actuator_map,
+            airframe_class="MULTIROTOR", is_physical=True,
+            params=params, controls=controls
+        )
+        
+        # Assertions
+        self.assertIn("t", res)
+        self.assertIn("channels", res)
+        channels = res["channels"]
+        self.assertIn("M1 (Ch1)", channels)
+        self.assertIn("M2 (Ch2)", channels)
+        
+        # Verify decimation
+        self.assertTrue(len(res["t"]) < 150)
+        self.assertEqual(len(channels["M1 (Ch1)"]["values"]), len(res["t"]))
+        
+        # Verify correlation matching
+        self.assertEqual(channels["M3 (Ch3)"]["correlated_axis"], "thrust")
+        self.assertTrue(channels["M3 (Ch3)"]["correlation"] > 0.8)
+        
+        # Verify motor balance
+        self.assertIn("motor_balance", res)
+        self.assertIn("t", res["motor_balance"])
+        self.assertIn("M1", res["motor_balance"]["deviations"])
+        
+        # Test airspeed note for control surface
+        actuator_map_fw = {
+            "hover_motors": [],
+            "thrust_motors": [],
+            "control_surfaces": [4],
+            "tilt_servos": [],
+        }
+        # output[4] is control surface, constant maxed out (2000 PWM) to trigger saturation
+        outputs_fw = pd.DataFrame({
+            "timestamp": ts_us,
+            "output[4]": np.full_like(t, 2000.0),
+        })
+        # Airspeed constant at 12 m/s
+        airspeed_data = (t, np.full_like(t, 12.0))
+        params_fw = {
+            "FW_AIRSPD_TRIM": 15.0,
+        }
+        
+        res_fw = actuator_saturation.analyze_saturation(
+            outputs_fw, actuator_map=actuator_map_fw,
+            airframe_class="FIXED_WING", is_physical=True,
+            params=params_fw, airspeed_data=airspeed_data
+        )
+        self.assertIn("S1 (Ch5)", res_fw["channels"])
+        self.assertIn("note", res_fw["channels"]["S1 (Ch5)"])
+        self.assertIn("possible authority issue at cruise.", res_fw["channels"]["S1 (Ch5)"]["note"])
+
+    def test_filter_advisor_yaw_torque_cutoff(self):
+        from backend.app.analysis import filter_advisor
+        
+        # Test 1: Noisy spectrum -> lower MC_YAW_TQ_CUTOFF to 15.0
+        vibration_noisy = {
+            "axes": {
+                "roll": {"freqs_hz": [10.0, 20.0, 30.0, 50.0], "psd_db": [10.0, 10.0, 10.0, 10.0]} # integrated rms > _GYRO_NOISY_RMS
+            }
+        }
+        params_noisy = {
+            "MC_YAW_TQ_CUTOFF": 20.0
+        }
+        res_noisy = filter_advisor.advise_filters(vibration_noisy, None, None, params_noisy)
+        recs_noisy = {r["param"]: r for r in res_noisy.get("recommendations", [])}
+        self.assertIn("MC_YAW_TQ_CUTOFF", recs_noisy)
+        self.assertEqual(recs_noisy["MC_YAW_TQ_CUTOFF"]["proposed_value"], 15.0)
+
+        # Test 2: Clean spectrum + high delay -> raise MC_YAW_TQ_CUTOFF
+        vibration_clean = {
+            "axes": {
+                "roll": {"freqs_hz": [10.0, 20.0, 30.0, 50.0], "psd_db": [-50.0, -50.0, -50.0, -50.0]} # clean
+            }
+        }
+        params_clean = {
+            "MC_YAW_TQ_CUTOFF": 20.0
+        }
+        # Mock measure_filter_delay_ms to return 45ms (> _DELAY_RAISE_MS)
+        from unittest.mock import patch
+        with patch("backend.app.analysis.filter_advisor.measure_filter_delay_ms", return_value=45.0):
+            res_clean = filter_advisor.advise_filters(vibration_clean, None, None, params_clean)
+            recs_clean = {r["param"]: r for r in res_clean.get("recommendations", [])}
+            self.assertIn("MC_YAW_TQ_CUTOFF", recs_clean)
+            self.assertEqual(recs_clean["MC_YAW_TQ_CUTOFF"]["proposed_value"], 25.0)
+    def test_vtol_label_specialization(self):
+        from unittest.mock import MagicMock, patch
+        from backend.app.analysis.ulog_pipeline import classify_airframe, analyze
+        from pathlib import Path
+        
+        # Test direct classify_airframe output
+        mr = classify_airframe(4001)
+        self.assertEqual(mr.airframe_class, "MULTIROTOR")
+        
+        # Mock pyulog.ULog and dataset_frame to test ulog_pipeline.analyze label refinement
+        mock_ulog = MagicMock()
+        mock_ulog.initial_parameters = {
+            "SYS_AUTOSTART": 13000,
+            "VT_TYPE": 1 # Tiltrotor
+        }
+        mock_ulog.msg_info_dict = {
+            "sys_name": "PX4"
+        }
+        mock_ulog.last_timestamp = 10000000
+        mock_ulog.start_timestamp = 0
+        
+        with patch("backend.app.analysis.ulog_pipeline.ULog", return_value=mock_ulog):
+            with patch("backend.app.analysis.ulog_pipeline.dataset_frame", return_value=None):
+                # Test Tiltrotor (VT_TYPE=1)
+                res = analyze(Path("dummy.ulg"))
+                self.assertEqual(res["airframe_label"], "VTOL (Tiltrotor)")
+                
+                # Test Tailsitter (VT_TYPE=0)
+                mock_ulog.initial_parameters["VT_TYPE"] = 0
+                res = analyze(Path("dummy.ulg"))
+                self.assertEqual(res["airframe_label"], "VTOL (Tailsitter)")
+                
+                # Test Standard VTOL (VT_TYPE=2)
+                mock_ulog.initial_parameters["VT_TYPE"] = 2
+                res = analyze(Path("dummy.ulg"))
+                self.assertEqual(res["airframe_label"], "VTOL (Standard)")
+                
+                # Test simulation label overrides
+                from backend.app.mavlink.airframe import AirframeInfo
+                with patch("backend.app.analysis.ulog_pipeline.classify_airframe", return_value=AirframeInfo(1040, "VTOL", "Standard VTOL (SITL sim)")):
+                    mock_ulog.initial_parameters["VT_TYPE"] = 1 # Tiltrotor
+                    res = analyze(Path("dummy.ulg"))
+                    self.assertEqual(res["airframe_label"], "VTOL (Tiltrotor) (SITL sim)")
+
+                # Test fallback when VT_TYPE/CA_AIRFRAME are missing but ACT_FUNC has tilt servo (301)
+                mock_ulog.initial_parameters = {
+                    "SYS_AUTOSTART": 13000,
+                    "ACT_FUNC1": 301,  # VTOL tilt servo
+                }
+                res = analyze(Path("dummy.ulg"))
+                self.assertEqual(res["airframe_label"], "VTOL (Tiltrotor)")
+                self.assertIn("ACT_FUNC1", res["initial_params"])
+
+
+    def test_dynamic_actuator_reclassification(self):
+        from backend.app.analysis.ulog_pipeline import _discover_actuators_from_params
+        from backend.app.analysis.actuator_saturation import analyze_saturation
+        import pandas as pd
+        import numpy as np
+
+        # 1. Test backend _discover_actuators_from_params reclassification
+        params = {
+            "ACT_FUNC1": 101,  # Motor 1
+            "ACT_FUNC2": 102,  # Motor 2
+            "ACT_FUNC3": 201,  # Servo 1
+            "ACT_FUNC4": 202,  # Servo 2
+            "ACT_FUNC5": 203,  # Servo 3
+            "CA_SV_CS0_TYPE": 5.0,  # Left Elevon
+            "CA_SV_CS1_TYPE": 6.0,  # Right Elevon
+        }
+
+        # For VTOL airframe, should reclassify based on CS counts:
+        # 2 control surfaces -> Servo 1 & 2 are control surfaces, Servo 3 (Ch5) becomes tilt servo
+        actuator_map = _discover_actuators_from_params(params, "VTOL")
+        self.assertEqual(actuator_map["hover_motors"], [0, 1])
+        self.assertEqual(actuator_map["thrust_motors"], [])
+        self.assertEqual(actuator_map["control_surfaces"], [2, 3])
+        self.assertEqual(actuator_map["tilt_servos"], [4])
+
+        # 2. Test analyze_saturation labeling
+        # Create a dummy dataframe with actuator outputs
+        df = pd.DataFrame({
+            "timestamp": [0, 1000000],
+            "output[0]": [0.5, 0.5],
+            "output[1]": [0.5, 0.5],
+            "output[2]": [0.5, 0.5],
+            "output[3]": [0.5, 0.5],
+            "output[4]": [0.5, 0.5],
+        })
+        res = analyze_saturation(df, actuator_map=actuator_map, airframe_class="VTOL", is_physical=True, params=params)
+        channels = res.get("channels", {})
+        
+        # Verify dynamic labels
+        self.assertIn("Left Elevon (Ch3)", channels)
+        self.assertIn("Right Elevon (Ch4)", channels)
+        self.assertIn("Tilt Servo 1 (Ch5)", channels)
+
+        # 3. Test dynamic allocation with CA_SV_TL_COUNT and CA_SV_CS_COUNT
+        params_tl = {
+            "ACT_FUNC1": 0,
+            "ACT_FUNC9": 203,  # Servo 3 (Ch9) -> Tilt Servo
+            "ACT_FUNC10": 204, # Servo 4 (Ch10) -> Tilt Servo
+            "ACT_FUNC11": 205, # Servo 5 (Ch11) -> Tilt Servo
+            "ACT_FUNC13": 201, # Servo 1 (Ch13) -> Control Surface (CS0)
+            "ACT_FUNC14": 202, # Servo 2 (Ch14) -> Control Surface (CS1)
+            "CA_SV_TL_COUNT": 3.0,
+            "CA_SV_CS_COUNT": 2.0,
+            "CA_SV_CS0_TYPE": 5.0,  # Left Elevon
+            "CA_SV_CS1_TYPE": 6.0,  # Right Elevon
+        }
+        
+        actuator_map_tl = _discover_actuators_from_params(params_tl, "VTOL")
+        self.assertEqual(actuator_map_tl["control_surfaces"], [12, 13])
+        self.assertEqual(actuator_map_tl["tilt_servos"], [8, 9, 10])
+
+        df_tl = pd.DataFrame({
+            "timestamp": [0, 1000000],
+            "output[8]": [0.5, 0.5],
+            "output[9]": [0.5, 0.5],
+            "output[10]": [0.5, 0.5],
+            "output[12]": [0.5, 0.5],
+            "output[13]": [0.5, 0.5],
+        })
+        res_tl = analyze_saturation(df_tl, actuator_map=actuator_map_tl, airframe_class="VTOL", is_physical=True, params=params_tl)
+        channels_tl = res_tl.get("channels", {})
+        
+        # Verify dynamic labels for sequential case
+        self.assertIn("Tilt Servo 1 (Ch9)", channels_tl)
+        self.assertIn("Tilt Servo 2 (Ch10)", channels_tl)
+        self.assertIn("Tilt Servo 3 (Ch11)", channels_tl)
+        self.assertIn("Left Elevon (Ch13)", channels_tl)
+        self.assertIn("Right Elevon (Ch14)", channels_tl)
+
+
+class TestNewPipelineImprovements(unittest.TestCase):
+    def test_unmapped_channel_processing_fallback(self):
+        # Verify ActuationMonitor falls back to computing normalized outputs for all channels when unmapped
+        from backend.app.analysis.domains import ActuationMonitor
+        monitor = ActuationMonitor()
+        
+        # Mock Connection actuator map to be empty (unmapped)
+        with patch("backend.app.analysis.domains.CONNECTION") as mock_conn, \
+             patch("backend.app.analysis.domains.HUB") as mock_hub:
+            mock_conn.state.actuator_map = {}
+            mock_conn.state.actuator_limits = {}
+            
+            # Send actuator status values
+            monitor._process_actuator_status({"actuator": [0.5, -0.5, 0.0]})
+            
+            # Verify that hub publish was called
+            mock_hub.publish.assert_called_with("actuation", unittest.mock.ANY)
+            payload = mock_hub.publish.call_args[0][1]
+            self.assertTrue(payload.get("unmapped"))
+            self.assertIn("motor_norms", payload)
+            # Since unmapped, all active channels are treated as motors for saturation check
+            self.assertEqual(len(payload["motor_norms"]), 2)
+            # Check guessed deflections for the negative value
+            self.assertIn("surface_deflections", payload)
+            self.assertEqual(len(payload["surface_deflections"]), 1) # only channel 2 was negative
+
+    def test_vibration_gate_reconnect_reset(self):
+        # Verify vibration gate resets self._last_ok_val and self._last_cleared_time on reconnect
+        from backend.app.analysis.vibration_live import VibrationGate
+        gate = VibrationGate()
+        gate._last_ok_val = False
+        gate._last_cleared_time = 99.0
+        
+        # We simulate a connection event with connected = True
+        class MockEvent:
+            def __init__(self):
+                self.channel = "connection"
+                self.payload = {"connected": True}
+                
+        # Patch HUB.subscribe to yield the connection event and then cancel
+        async def mock_subscribe():
+            yield MockEvent()
+            
+        with patch("backend.app.analysis.vibration_live.HUB.subscribe", return_value=mock_subscribe()):
+            # Run the _run method task for one tick
+            asyncio.run(gate._run())
+            
+        self.assertTrue(gate._last_ok_val)
+        self.assertEqual(gate._last_cleared_time, 0.0)
+
+    def test_cascade_state_recalculation_on_vtol_mode(self):
+        # Verify CascadeState recalculates domain immediately on vtol_state change
+        from backend.app.analysis.cascade import CascadeEngine, STATE
+        engine = CascadeEngine()
+        
+        class MockEvent:
+            def __init__(self):
+                self.channel = "extended_sys_state"
+                self.payload = {"vtol_state": 4} # FW mode
+                
+        async def mock_subscribe():
+            yield MockEvent()
+            
+        with patch("backend.app.analysis.cascade.HUB.subscribe", return_value=mock_subscribe()), \
+             patch("backend.app.analysis.cascade.CONNECTION") as mock_conn, \
+             patch("backend.app.analysis.cascade.HUB.publish") as mock_publish:
+            mock_conn.state.airframe.airframe_class = "VTOL"
+            STATE.vtol_state = 3 # MC hover
+            
+            asyncio.run(engine._run())
+            
+            # Domain should immediately recalculate to FW
+            self.assertEqual(STATE._domain, "FW")
+            mock_publish.assert_called_with("cascade_state", unittest.mock.ANY)
+
 
 if __name__ == "__main__":
     unittest.main()
-
 

@@ -74,7 +74,7 @@ analysis:
     compliance_reversals: 3
     
   live_pid:
-    window_s: 3.0
+    window_s: 5.0
     eval_period_s: 0.5
     r_depletion: 0.85
     high_rate_rad_s: 0.8
@@ -94,8 +94,8 @@ analysis:
 
   cascade:
     attitude_min_amp_deg: 5.0
-    velocity_min_amp: 0.5
-    position_min_amp: 1.0
+    velocity_min_amp: 0.2
+    position_min_amp: 0.3
     
   domains:
     pwm_min: 1000.0
@@ -125,10 +125,6 @@ ulog:
   upload_chunk: 1048576  # 1024 * 1024
   max_mib: 800
   tmp_dir: "~/.mint/uploads"
-
-# Tuning feedback memory
-tuning_history:
-  path: "~/.mint/tuning_history.jsonl"
 
 # Expert Mode Settings
 expert_mode:

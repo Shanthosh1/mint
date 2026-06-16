@@ -39,6 +39,8 @@ def sanitize_nan(val):
     elif isinstance(val, float):
         if math.isnan(val) or math.isinf(val):
             return None
+    elif isinstance(val, (int, str, bool)) or val is None:
+        return val
     else:
         try:
             if math.isnan(val) or math.isinf(val):

@@ -12,6 +12,43 @@ import { useTelemetryChannel } from '../hooks/useTelemetry.js';
 export default function ProposalsPanel() {
   const [proposals, setProposals] = useState([]);
   const [busyId, setBusyId] = useState(null);
+  
+  const renderConfidence = (conf) => {
+    if (!conf) return null;
+    if (typeof conf === 'string') {
+      return <span className="badge">{conf}</span>;
+    }
+    if (typeof conf === 'object' && conf.score !== undefined) {
+      const score = conf.score;
+      const flags = conf.flags || {};
+      
+      const explanations = {
+        pre_step_motion: "Pre-step motion present – may reduce accuracy.",
+        ramped_input: "Input was ramped – τ adjusted.",
+        low_coherence: "Low coherence in control band – step may be noisy.",
+        short_post_window: "Post-step window truncated – oscillation count uncertain.",
+        derived_from_attitude: "Yaw analysis derived from attitude setpoint (lower confidence).",
+      };
+      
+      const activeFlags = Object.entries(flags)
+        .filter(([key, val]) => {
+          if (key === 'osc_reliable') return !val;
+          return !!val;
+        })
+        .map(([key]) => key);
+        
+      const tooltipText = activeFlags.length > 0
+        ? activeFlags.map(f => f === 'osc_reliable' ? "Oscillation count uncertain." : explanations[f]).join('\n')
+        : "High confidence data.";
+
+      return (
+        <span className="badge" title={tooltipText} style={{ cursor: 'help', display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
+          Confidence: {Math.round(score * 100)}% ⓘ
+        </span>
+      );
+    }
+    return null;
+  };
   const [error, setError] = useState(null);
   const [host, setHost] = useState(null);
   const [confirmedRisks, setConfirmedRisks] = useState({});
@@ -39,16 +76,6 @@ export default function ProposalsPanel() {
     return null;
   };
 
-  const hasPendingFeedbackOnAxis = (param) => {
-    const axis = getAxis(param);
-    if (!axis) return false;
-    return proposals.some(x => 
-      x.state === 'written' && 
-      !x.feedback && 
-      x.is_saturation_gain_reduction && 
-      getAxis(x.param) === axis
-    );
-  };
 
   const approve = async (id) => {
     setBusyId(id); setError(null);
@@ -62,12 +89,6 @@ export default function ProposalsPanel() {
     refresh();
   };
 
-  const giveFeedback = async (id, outcome) => {
-    setError(null);
-    try { await api.proposalFeedback(id, outcome); }
-    catch (e) { setError(e.message); }
-    finally { refresh(); }
-  };
 
   const revert = async (id) => {
     setBusyId(id); setError(null);
@@ -81,25 +102,7 @@ export default function ProposalsPanel() {
     refresh();
   };
 
-  // Compact "✓2 ✗1" track record for a proposal's prior history, if any.
-  const historyLine = (h) => {
-    if (!h || !h.total) return null;
-    const dir = h.direction === 'raise' ? 'Raising' : h.direction === 'lower' ? 'Lowering' : 'Changing';
-    return (
-      <div className="muted" style={{ fontSize: '0.74rem', marginTop: 6 }}>
-        📊 {dir} this on {h.airframe_class} before:{' '}
-        <span style={{ color: 'var(--ok)' }}>✓{h.better} better</span>{' · '}
-        <span style={{ color: 'var(--crit)' }}>✗{h.worse} worse</span>
-        {h.no_change ? <> · ∅{h.no_change} no change</> : null}
-      </div>
-    );
-  };
 
-  const FEEDBACK = [
-    ['better', 'better'],
-    ['worse', 'worse'],
-    ['no_change', 'no change'],
-  ];
 
   const stateBadge = (p) => ({
     presented: <span className="badge"><span className="dot warn" />awaiting pilot</span>,
@@ -153,7 +156,7 @@ export default function ProposalsPanel() {
               <div className="row spread">
                 <span className="mono" style={{ fontWeight: 600 }}>{p.param}</span>
                 <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
-                  {p.confidence && <span className="badge">{p.confidence}</span>}
+                  {renderConfidence(p.confidence)}
                   {stateBadge(p)}
                 </div>
               </div>
@@ -174,7 +177,6 @@ export default function ProposalsPanel() {
               <div className="muted" style={{ fontSize: '0.74rem' }}>🛡 {p.safety_note}</div>
               {p.state === 'presented' && (
                 <>
-                  {historyLine(p.tuning_history)}
                   {p.is_saturation_gain_reduction && host?.expert_mode && (
                     <div style={{
                       background: 'rgba(251, 191, 36, 0.15)',
@@ -195,21 +197,6 @@ export default function ProposalsPanel() {
                       </label>
                     </div>
                   )}
-                  {hasPendingFeedbackOnAxis(p.param) && (
-                    <div style={{
-                      background: 'rgba(248, 113, 113, 0.15)',
-                      border: '1px solid rgba(248, 113, 113, 0.4)',
-                      borderRadius: '8px',
-                      padding: '8px 10px',
-                      marginTop: '10px',
-                      marginBottom: '10px',
-                      color: '#f87171',
-                      fontSize: '0.8rem',
-                      fontWeight: 500
-                    }}>
-                      ⚠️ Pending feedback required on this axis before making further tuning changes.
-                    </div>
-                  )}
                   <div className="row" style={{ marginTop: 10 }}>
                     <button className="btn approve" style={{ flex: 1 }}
                             disabled={busyId === p.id || (p.is_saturation_gain_reduction && !confirmedRisks[p.id])}
@@ -222,30 +209,7 @@ export default function ProposalsPanel() {
               )}
               {p.state === 'written' && (
                 <div style={{ marginTop: 10 }}>
-                  {p.feedback ? (
-                    <div className="muted" style={{ fontSize: '0.74rem' }}>
-                      Your verdict: <strong>{p.feedback.replace('_', ' ')}</strong> — thanks, logged for next time.
-                    </div>
-                  ) : (
-                    <>
-                      <div className="muted" style={{ fontSize: '0.74rem', marginBottom: 6, fontWeight: p.is_saturation_gain_reduction ? 'bold' : 'normal', color: p.is_saturation_gain_reduction ? 'var(--accent)' : 'inherit' }}>
-                        {p.is_saturation_gain_reduction ? "Did this help?" : "How did it fly?"}
-                      </div>
-                      <div className="row">
-                        {FEEDBACK.map(([value, label]) => (
-                          <button key={value} className="btn" style={{ flex: 1 }}
-                                  onClick={() => giveFeedback(p.id, value)}>
-                            {label}
-                          </button>
-                        ))}
-                        <button className="btn" style={{ flex: 1 }}
-                                onClick={() => giveFeedback(p.id, 'skip')}>
-                          Skip
-                        </button>
-                      </div>
-                    </>
-                  )}
-                  <button className="btn" style={{ marginTop: 8, width: '100%' }}
+                  <button className="btn" style={{ width: '100%' }}
                           disabled={busyId === p.id}
                           title={`Restore ${p.param} to its pre-write value ${p.current_value}`}
                           onClick={() => revert(p.id)}>

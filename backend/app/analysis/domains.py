@@ -106,7 +106,10 @@ class ActuationMonitor:
         self._vtol_state = 0
         _GRACE_PERIOD_S = 3.0  # wait this long for modern msg before fallback
 
-        async for event in HUB.subscribe():
+        async for event in HUB.subscribe(channels=frozenset({
+            "airframe", "vfr_hud", "extended_sys_state",
+            "actuator_output_status", "servo_output"
+        })):
             if event.channel == "airframe":
                 self.domain = domain_for(event.payload.get("airframe_class"))
             elif event.channel == "vfr_hud":
@@ -282,6 +285,44 @@ class ActuationMonitor:
                         ch_range = max(1.0, ch_max - ch_min)
                         norms.append(min(1.0, max(0.0, (raw_pwm - ch_min) / ch_range)))
                     hover_mapped_ch.append(ch + 1)
+        elif not has_mapped_channels:
+            # Fallback: treat all active channels as motors for saturation check
+            norms = [ch["norm"] for ch in raw_channels]
+            hover_mapped_ch = [ch["ch"] for ch in raw_channels]
+
+            # Heuristic to guess surface-like channels for UI raw bars
+            guessed_defls = []
+            guessed_surf_ch = []
+            for ch_info in raw_channels:
+                ch_idx = ch_info["ch"] - 1
+                raw_val = ch_info["raw"]
+                limits = getattr(CONNECTION.state, "actuator_limits", {}).get(ch_idx)
+                is_guessed_motor = True
+                if limits:
+                    ch_min = limits.get("min", _PWM_MIN)
+                    ch_trim = limits.get("trim", _PWM_MID)
+                    if abs(ch_trim - ch_min) > 100:
+                        is_guessed_motor = False
+                else:
+                    if is_raw:
+                        if abs(raw_val - _PWM_MID) < 100:
+                            is_guessed_motor = False
+                    else:
+                        v = values[ch_idx]
+                        import math
+                        if not math.isnan(v) and v < -0.05:
+                            is_guessed_motor = False
+                if not is_guessed_motor:
+                    ch_trim = limits.get("trim", _PWM_MID) if limits else _PWM_MID
+                    ch_range = limits.get("range", _PWM_RANGE) if limits else _PWM_RANGE
+                    d = (raw_val - ch_trim) / ch_range
+                    d_val = min(1.0, max(-1.0, d))
+                    guessed_defls.append(round(d_val, 2))
+                    guessed_surf_ch.append(ch_info["ch"])
+
+            if guessed_defls:
+                payload["surface_deflections"] = guessed_defls
+                payload["surface_channels"] = guessed_surf_ch
                         
         if self.domain == "hybrid" and self._vtol_state == 4:
             norms = [0.0] * len(norms)
@@ -296,9 +337,10 @@ class ActuationMonitor:
                                    text="Motor saturation: one or more motors pinned at "
                                         "maximum output. Reduce aggressive rate gains, "
                                         "payload, or maneuver intensity.")
-            balance = self._check_motor_balance(norms, now)
-            if balance is not None:
-                payload["motor_balance"] = balance
+            if has_mapped_channels:
+                balance = self._check_motor_balance(norms, now)
+                if balance is not None:
+                    payload["motor_balance"] = balance
 
         # 2. Process Thrust Motors — always include mapped channels
         thrust_norms = []

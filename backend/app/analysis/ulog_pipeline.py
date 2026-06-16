@@ -16,6 +16,7 @@ import uuid
 from pathlib import Path
 
 import pandas as pd
+import numpy as np
 from pyulog import ULog
 
 import re
@@ -51,6 +52,33 @@ def _parse_px4_version(ver_sw: str | None) -> tuple[int, int, int] | None:
     patch = int(m.group(3)) if m.group(3) else 0
     return major, minor, patch
 
+
+def _decode_ver_sw_release(release_val: int) -> tuple[int, int, int, int] | None:
+    """Decode the 32-bit uint32_t release version (0xAABBCCTT) from ULog."""
+    try:
+        val = int(release_val)
+        major = (val >> 24) & 0xFF
+        minor = (val >> 16) & 0xFF
+        patch = (val >> 8) & 0xFF
+        release_type = val & 0xFF
+        return major, minor, patch, release_type
+    except (ValueError, TypeError):
+        return None
+
+
+def _format_ver_sw_release(major: int, minor: int, patch: int, release_type: int) -> str:
+    """Format the decoded release components into a version string matching Flight Review."""
+    if release_type == 255:
+        return f"v{major}.{minor}.{patch}"
+    elif release_type >= 192:
+        return f"v{major}.{minor}.{patch}-rc{release_type - 192}"
+    elif release_type >= 128:
+        return f"v{major}.{minor}.{patch}-beta{release_type - 128}"
+    elif release_type >= 64:
+        return f"v{major}.{minor}.{patch}-alpha{release_type - 64}"
+    else:
+        return f"v{major}.{minor}.{patch}-dev{release_type}"
+
 # Only these datasets are ever materialized into memory.
 _DATASETS = [
     "sensor_combined",
@@ -66,6 +94,8 @@ _DATASETS = [
     "vehicle_air_data",           # baro altitude (EKF2_BARO_DELAY)
     "vehicle_status",
     "vtol_vehicle_status",
+    "airspeed",
+    "airspeed_validated",
 ]
 
 
@@ -114,6 +144,31 @@ def dataset_frame(ulog: ULog, name: str, instance: int = 0) -> pd.DataFrame | No
     return pd.DataFrame(ds.data)
 
 
+def _get_airspeed_series(ulog: ULog) -> tuple[np.ndarray, np.ndarray] | None:
+    """Extract airspeed time-series from 'airspeed' or 'airspeed_validated' topic."""
+    df = dataset_frame(ulog, "airspeed")
+    if df is None:
+        df = dataset_frame(ulog, "airspeed_validated")
+    if df is None:
+        return None
+
+    if "timestamp" not in df.columns:
+        return None
+
+    val_col = None
+    for col in ["indicated_airspeed_m_s", "true_airspeed_m_s", "calibrated_airspeed_m_s", "airspeed"]:
+        if col in df.columns:
+            val_col = col
+            break
+
+    if val_col is None:
+        return None
+
+    ts = df["timestamp"].to_numpy(dtype=np.float64) / 1e6
+    vals = df[val_col].to_numpy(dtype=np.float64)
+    return ts, vals
+
+
 def _discover_actuators_from_params(params: dict, airframe_class: str) -> dict:
     """Reconstruct the actuator_map dictionary from ULog initial parameters dictionary."""
     actuator_map = {
@@ -137,6 +192,8 @@ def _discover_actuators_from_params(params: dict, airframe_class: str) -> dict:
     if not selected_family:
         return actuator_map
 
+    servo_channels = [] # list of (servo_idx, channel_idx)
+
     def map_func(func_val: int, channel_idx: int):
         if 101 <= func_val <= 112:
             if airframe_class == "MULTIROTOR":
@@ -150,6 +207,7 @@ def _discover_actuators_from_params(params: dict, airframe_class: str) -> dict:
                     actuator_map["thrust_motors"].append(channel_idx)
         elif 201 <= func_val <= 208:
             actuator_map["control_surfaces"].append(channel_idx)
+            servo_channels.append((func_val - 201, channel_idx))
         elif 301 <= func_val <= 308:
             actuator_map["tilt_servos"].append(channel_idx)
 
@@ -190,6 +248,31 @@ def _discover_actuators_from_params(params: dict, airframe_class: str) -> dict:
             if val is not None and int(val) > 0:
                 map_func(int(val), 8 + j - 1)
 
+    # 3. Dynamic Control Allocation Reclassification
+    # If CA_SV_CS{i}_TYPE parameters exist, assign physical channels dynamically
+    # based on whether their logical servo index is configured as a control surface (>0) or tilt servo.
+    has_cs_params = any(f"CA_SV_CS{i}_TYPE" in params for i in range(8))
+    if has_cs_params and servo_channels:
+        dynamic_cs = []
+        dynamic_tilt = []
+        cs_count = int(float(params.get("CA_SV_CS_COUNT", 0)))
+        if cs_count == 0:
+            cs_count = sum(1 for i in range(8) if int(float(params.get(f"CA_SV_CS{i}_TYPE", 0))) > 0)
+        for servo_idx, channel_idx in sorted(servo_channels):
+            if cs_count > 0:
+                if servo_idx < cs_count:
+                    cs_type = int(float(params.get(f"CA_SV_CS{servo_idx}_TYPE", 0)))
+                    if cs_type > 0:
+                        dynamic_cs.append(channel_idx)
+                    else:
+                        dynamic_tilt.append(channel_idx)
+                else:
+                    dynamic_tilt.append(channel_idx)
+            else:
+                dynamic_tilt.append(channel_idx)
+        actuator_map["control_surfaces"] = dynamic_cs
+        actuator_map["tilt_servos"] = dynamic_tilt
+
     return actuator_map
 
 
@@ -211,20 +294,48 @@ def analyze(path: Path) -> dict:
             f"Log was produced by '{sys_name}', not PX4. MINT supports PX4 only."
         )
     
+    ver = None
+    px4_version_str = "unknown"
+
+    ver_sw_release = ulog.msg_info_dict.get("ver_sw_release")
     ver_sw = ulog.msg_info_dict.get("ver_sw")
-    if ver_sw:
-        ver = _parse_px4_version(ver_sw)
+
+    if ver_sw_release is not None:
+        try:
+            release_val = ver_sw_release[0] if isinstance(ver_sw_release, (list, tuple)) else ver_sw_release
+            decoded = _decode_ver_sw_release(release_val)
+            if decoded is not None:
+                major, minor, patch, release_type = decoded
+                ver = (major, minor, patch)
+                release_str = _format_ver_sw_release(major, minor, patch, release_type)
+                
+                commit_hash = ""
+                if ver_sw:
+                    commit_str = ver_sw[0] if isinstance(ver_sw, (list, tuple)) else str(ver_sw)
+                    if len(commit_str) >= 8:
+                        commit_hash = f" ({commit_str[:8]})"
+                px4_version_str = f"{release_str}{commit_hash}"
+        except Exception as e:
+            log.warning("Failed to decode ver_sw_release: %s", e)
+
+    if ver is None and ver_sw:
+        ver_sw_str = ver_sw[0] if isinstance(ver_sw, (list, tuple)) else str(ver_sw)
+        ver = _parse_px4_version(ver_sw_str)
         if ver is not None:
-            if ver[:2] < config.MIN_PX4_VERSION:
-                floor = config.MIN_PX4_VERSION
-                raise UnsupportedLogError(
-                    f"Log is from PX4 v{ver[0]}.{ver[1]}.{ver[2]}, older than the "
-                    f"supported minimum v{floor[0]}.{floor[1]}."
-                )
+            px4_version_str = ver_sw_str
         else:
-            log.warning("Could not parse PX4 firmware version string '%s' — proceeding with analysis.", ver_sw)
+            log.warning("Could not parse PX4 firmware version string '%s' — proceeding with analysis.", ver_sw_str)
+            px4_version_str = ver_sw_str
+
+    if ver is not None:
+        if ver[:2] < config.MIN_PX4_VERSION:
+            floor = config.MIN_PX4_VERSION
+            raise UnsupportedLogError(
+                f"Log is from PX4 v{ver[0]}.{ver[1]}.{ver[2]}, older than the "
+                f"supported minimum v{floor[0]}.{floor[1]}."
+            )
     else:
-        log.warning("PX4 firmware version (ver_sw) is missing from log metadata — proceeding with caution.")
+        log.warning("PX4 firmware version is missing or unrecognized — proceeding with caution.")
 
     # Airframe class from the log itself — drives which gain parameters
     # the PID advisor targets, independent of any live connection. An
@@ -240,16 +351,64 @@ def analyze(path: Path) -> dict:
     except UnsupportedAirframeError as exc:
         raise UnsupportedLogError(str(exc)) from exc
 
+    # Reconstruct actuator map from initial log parameters
+    actuator_map = _discover_actuators_from_params(ulog.initial_parameters, airframe.airframe_class)
+
+    airframe_label = airframe.label
+    if airframe.airframe_class == "VTOL":
+        vt_type = ulog.initial_parameters.get("VT_TYPE")
+        ca_airframe = ulog.initial_parameters.get("CA_AIRFRAME")
+        sub_type = None
+        
+        if vt_type is not None:
+            try:
+                vt_type_val = int(float(vt_type))
+                if vt_type_val == 0:
+                    sub_type = "Tailsitter"
+                elif vt_type_val == 1:
+                    sub_type = "Tiltrotor"
+                elif vt_type_val == 2:
+                    sub_type = "Standard"
+            except (ValueError, TypeError):
+                pass
+                
+        if not sub_type and ca_airframe is not None:
+            try:
+                ca_val = int(float(ca_airframe))
+                if ca_val == 2:
+                    sub_type = "Standard"
+                elif ca_val == 3:
+                    sub_type = "Tiltrotor"
+                elif ca_val == 4:
+                    sub_type = "Tailsitter"
+            except (ValueError, TypeError):
+                pass
+
+        if not sub_type and actuator_map.get("tilt_servos"):
+            sub_type = "Tiltrotor"
+
+        if sub_type:
+            if "standard/tiltrotor/tailsitter" in airframe.label.lower() or "standard vtol" in airframe.label.lower():
+                sim_suffix = ""
+                for s in ("(SITL sim)", "(HIL sim)", "(SIH sim)", "(sim)"):
+                    if s.lower() in airframe.label.lower():
+                        sim_suffix = f" {s}"
+                        break
+                airframe_label = f"VTOL ({sub_type}){sim_suffix}"
+            else:
+                if sub_type.lower() not in airframe.label.lower():
+                    airframe_label = f"{airframe.label} ({sub_type})"
+
     report: dict = {
         "file": path.name,
         "duration_s": round((ulog.last_timestamp - ulog.start_timestamp) / 1e6, 1),
-        "px4_version": ulog.msg_info_dict.get("ver_sw", "unknown"),
+        "px4_version": px4_version_str,
         "sys_autostart": sys_autostart,
         "airframe_class": airframe.airframe_class,
-        "airframe_label": airframe.label,
+        "airframe_label": airframe_label,
         "initial_params": {
             k: v for k, v in ulog.initial_parameters.items()
-            if k.startswith(("MC_", "FW_", "IMU_", "EKF2_"))
+            if k.startswith(("MC_", "FW_", "IMU_", "EKF2_", "PWM_", "OUT_", "CA_", "VT_", "ACT_", "SIM_", "HIL_")) or (k.startswith("OUT") and len(k) > 3 and k[3].isdigit())
         },
         "sections": {},
     }
@@ -271,6 +430,8 @@ def analyze(path: Path) -> dict:
     air_data = dataset_frame(ulog, "vehicle_air_data")
     status = dataset_frame(ulog, "vehicle_status")
     vtol_status = dataset_frame(ulog, "vtol_vehicle_status")
+    att_sp = dataset_frame(ulog, "vehicle_attitude_setpoint")
+    vehicle_att = dataset_frame(ulog, "vehicle_attitude")
 
     sections = report["sections"]
     sections["pid"] = pid_offline.analyze_pid(
@@ -279,6 +440,8 @@ def analyze(path: Path) -> dict:
         airframe_class=report["airframe_class"],
         status=status,
         vtol_status=vtol_status,
+        att_sp=att_sp,
+        vehicle_att=vehicle_att,
     )
     sections["vibration"] = (
         vibration_fft.analyze_vibration(sensor)
@@ -289,13 +452,13 @@ def analyze(path: Path) -> dict:
         params=report["initial_params"],
     )
 
-    # Reconstruct actuator map from initial log parameters
-    actuator_map = _discover_actuators_from_params(ulog.initial_parameters, report["airframe_class"])
-
     if actuators is not None:
+        controls = dataset_frame(ulog, "actuator_controls_0")
+        airspeed_data = _get_airspeed_series(ulog)
         sections["actuator_saturation"] = actuator_saturation.analyze_saturation(
             actuators, actuator_map=actuator_map,
-            airframe_class=report["airframe_class"], is_physical=is_physical
+            airframe_class=report["airframe_class"], is_physical=is_physical,
+            params=report["initial_params"], controls=controls, airspeed_data=airspeed_data
         )
         if not any(actuator_map.values()):
             sections["actuator_saturation"]["actuator_discovery_failed"] = True

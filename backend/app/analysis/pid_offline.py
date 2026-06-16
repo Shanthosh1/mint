@@ -24,20 +24,25 @@ and the pilot's Approve & Write step exactly like live advice.
 """
 from __future__ import annotations
 
+import math
+from typing import Optional
 import numpy as np
 import pandas as pd
+import scipy.signal
 
-from .live_pid import LivePidEngine
+from .live_pid import LivePidEngine, compute_coherence_in_band
 
 _RESAMPLE_HZ = 100.0
-_STEP_SCAN_SPAN_S = 0.1     # rate change measured across this span
-_STEP_MIN_RAD_S = 0.3       # smallest commanded change worth analysing
+_STEP_SCAN_SPAN_S = 0.25     # rate change measured across this span
+_STEP_MIN_RAD_S = 0.15      # smallest commanded change worth analysing
+_STEP_MIN_RAD_S_YAW = 0.08  # smallest commanded change worth analysing for yaw
 _EVENT_SPACING_S = 1.0
-_PRE_S, _POST_S = 0.5, 1.5
+_PRE_S, _POST_S = 0.5, 2.5
 _MAX_EVENTS_PER_AXIS = 40
 _OVERSHOOT_LIMIT = 0.25
 _R_DEPLETION = 0.85
 _GAIN_TRIM = 0.10           # proposed +/-10% per analysis pass
+_SETTLE_BAND = 0.20
 
 _SP_COLS = {"roll": "roll", "pitch": "pitch", "yaw": "yaw"}
 _ACT_COLS = {"roll": "xyz[0]", "pitch": "xyz[1]", "yaw": "xyz[2]"}
@@ -49,6 +54,14 @@ _RATE_P_PARAM = {
     "VTOL": {"roll": "MC_ROLLRATE_P", "pitch": "MC_PITCHRATE_P", "yaw": None},
     "FIXED_WING": {"roll": "FW_RR_P", "pitch": "FW_PR_P", "yaw": "FW_YR_P"},
     "DELTA_WING": {"roll": "FW_RR_P", "pitch": "FW_PR_P", "yaw": None},
+}
+
+# Axis -> attitude parameter (P for MC, TC for FW), per safety class.
+_ATTITUDE_PARAM = {
+    "MULTIROTOR": {"roll": "MC_ROLL_P", "pitch": "MC_PITCH_P", "yaw": "MC_YAW_P"},
+    "VTOL": {"roll": "MC_ROLL_P", "pitch": "MC_PITCH_P", "yaw": "MC_YAW_P"},
+    "FIXED_WING": {"roll": "FW_R_TC", "pitch": "FW_P_TC", "yaw": None},
+    "DELTA_WING": {"roll": "FW_R_TC", "pitch": "FW_P_TC", "yaw": None},
 }
 
 
@@ -63,11 +76,11 @@ def _uniform(df: pd.DataFrame, col: str) -> tuple[np.ndarray, np.ndarray] | None
     return grid, np.interp(grid, t, x)
 
 
-def _find_step_indices(sp: np.ndarray) -> list[int]:
+def _find_step_indices(sp: np.ndarray, threshold: float = _STEP_MIN_RAD_S) -> list[int]:
     """Indices where the commanded rate changes sharply."""
     span = int(_STEP_SCAN_SPAN_S * _RESAMPLE_HZ)
     change = np.abs(sp[span:] - sp[:-span])
-    hot = np.flatnonzero(change > _STEP_MIN_RAD_S)
+    hot = np.flatnonzero(change > threshold)
     if hot.size == 0:
         return []
     # Collapse runs of hot samples into one event each, keeping spacing.
@@ -80,33 +93,472 @@ def _find_step_indices(sp: np.ndarray) -> list[int]:
         if len(events) >= _MAX_EVENTS_PER_AXIS:
             break
     return events
-def _analyze_axis(t: np.ndarray, sp: np.ndarray, act: np.ndarray, step_mask: np.ndarray | None = None) -> dict:
-    pre = int(_PRE_S * _RESAMPLE_HZ)
-    post = int(_POST_S * _RESAMPLE_HZ)
+def _extract_euler_angles(df: pd.DataFrame | None) -> dict[str, np.ndarray] | None:
+    if df is None or len(df) == 0:
+        return None
+
+    # Check for direct Euler columns first (common in some setpoint logs)
+    euler_cols_body = ["roll_body", "pitch_body", "yaw_body"]
+    if any(c in df.columns for c in euler_cols_body):
+        return {
+            "roll": df["roll_body"].to_numpy(np.float64) if "roll_body" in df.columns else np.zeros(len(df), dtype=np.float64),
+            "pitch": df["pitch_body"].to_numpy(np.float64) if "pitch_body" in df.columns else np.zeros(len(df), dtype=np.float64),
+            "yaw": df["yaw_body"].to_numpy(np.float64) if "yaw_body" in df.columns else np.zeros(len(df), dtype=np.float64)
+        }
+
+    euler_cols_raw = ["roll", "pitch", "yaw"]
+    if any(c in df.columns for c in euler_cols_raw):
+        return {
+            "roll": df["roll"].to_numpy(np.float64) if "roll" in df.columns else np.zeros(len(df), dtype=np.float64),
+            "pitch": df["pitch"].to_numpy(np.float64) if "pitch" in df.columns else np.zeros(len(df), dtype=np.float64),
+            "yaw": df["yaw"].to_numpy(np.float64) if "yaw" in df.columns else np.zeros(len(df), dtype=np.float64)
+        }
+
+    # Check for quaternion columns
+    # Setpoint quaternions usually prefix with q_d
+    q_d_cols = ["q_d[0]", "q_d[1]", "q_d[2]", "q_d[3]"]
+    if all(c in df.columns for c in q_d_cols):
+        w = df["q_d[0]"].to_numpy(np.float64)
+        x = df["q_d[1]"].to_numpy(np.float64)
+        y = df["q_d[2]"].to_numpy(np.float64)
+        z = df["q_d[3]"].to_numpy(np.float64)
+        
+        roll = np.arctan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y))
+        pitch = np.arcsin(np.clip(2 * (w * y - z * x), -1.0, 1.0))
+        yaw = np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+        return {"roll": roll, "pitch": pitch, "yaw": yaw}
+
+    # Actual quaternions usually prefix with q
+    q_cols = ["q[0]", "q[1]", "q[2]", "q[3]"]
+    if all(c in df.columns for c in q_cols):
+        w = df["q[0]"].to_numpy(np.float64)
+        x = df["q[1]"].to_numpy(np.float64)
+        y = df["q[2]"].to_numpy(np.float64)
+        z = df["q[3]"].to_numpy(np.float64)
+        
+        roll = np.arctan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y))
+        pitch = np.arcsin(np.clip(2 * (w * y - z * x), -1.0, 1.0))
+        yaw = np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+        return {"roll": roll, "pitch": pitch, "yaw": yaw}
+
+    return None
+
+
+def compute_fd_gain(t: np.ndarray, x: np.ndarray, y: np.ndarray) -> Optional[float]:
+    """
+    Compute frequency-domain closed-loop transfer function gain |H(f)| = |P_xy(f) / P_xx(f)|
+    averaged over the low-frequency band [0.5, 1.0] Hz.
+    """
+    if len(t) < 20 or (t[-1] - t[0]) <= 0:
+        return None
+    dt = np.diff(t)
+    mean_dt = np.mean(dt) if dt.size > 0 else 0.01
+    if mean_dt <= 0:
+        return None
+    fs = 1.0 / mean_dt
+    try:
+        x_detrend = scipy.signal.detrend(x)
+        y_detrend = scipy.signal.detrend(y)
+    except Exception:
+        return None
+    nperseg = min(len(x), max(64, len(x) // 4))
+    if nperseg < 8:
+        return None
+    try:
+        f_welch, Pxx = scipy.signal.welch(x_detrend, fs=fs, nperseg=nperseg)
+        f_csd, Pxy = scipy.signal.csd(x_detrend, y_detrend, fs=fs, nperseg=nperseg)
+    except Exception:
+        return None
+    if len(Pxx) != len(Pxy):
+        return None
+    H = np.zeros_like(Pxy, dtype=complex)
+    valid_mask = Pxx > 1e-12
+    H[valid_mask] = Pxy[valid_mask] / Pxx[valid_mask]
+    gain = np.abs(H)
+    band_mask = (f_welch >= 0.5) & (f_welch <= 1.0)
+    if not band_mask.any():
+        closest_idx = np.argmin(np.abs(f_welch - 0.75))
+        return float(gain[closest_idx])
+    return float(np.mean(gain[band_mask]))
+
+
+def _step_response_offline(t: np.ndarray, sp: np.ndarray, act: np.ndarray,
+                           min_amp: float = 0.15,
+                           last_step_t: Optional[float] = None,
+                           derived: bool = False) -> tuple[Optional[dict], Optional[str]]:
+    """
+    Offline step response extraction, decoupled from VIB_GATE.
+    Returns (res_dict, rejection_reason).
+    """
+    if len(sp) < 20:
+        return None, "window_too_short"
+    i = int(np.argmax(np.abs(np.diff(sp))))
+    t0_temp = t[i + 1]
+
+    # Go backwards from i to find the start of the stick movement
+    diff_sp = np.diff(sp)
+    step_dir = np.sign(diff_sp[i]) if diff_sp[i] != 0 else 1.0
+    
+    i_start = i
+    while i_start > 0:
+        if np.sign(diff_sp[i_start - 1]) != step_dir or abs(diff_sp[i_start - 1]) < 0.005:
+            break
+        i_start -= 1
+        
+    t_start = t[i_start]
+    pre_window = 0.3 if (last_step_t is not None and (t_start - last_step_t) < 3.0) else 1.0
+    pre_mask = (t >= t_start - pre_window) & (t < t_start)
+    
+    if pre_mask.sum() < 3:
+        return None, "window_too_short"
+
+    sp_pre = float(np.mean(sp[pre_mask]))
+    
+    # 1. Temporary step response calculation to locate 5% deflection point
+    post_mask_temp = t >= t0_temp
+    sp_post_vals_temp = sp[post_mask_temp]
+    if len(sp_post_vals_temp) < 8:
+        return None, "window_too_short"
+        
+    abs_deflections_temp = np.abs(sp_post_vals_temp - sp_pre)
+    idx_peak_temp = int(np.argmax(abs_deflections_temp))
+    peak_def_temp = abs_deflections_temp[idx_peak_temp]
+    
+    # Apply temporary 50% decay window truncation to avoid pulse return-to-zero in sp_post estimation
+    cut_temp = None
+    for idx in range(idx_peak_temp, len(abs_deflections_temp)):
+        if abs_deflections_temp[idx] < 0.5 * peak_def_temp:
+            cut_temp = idx
+            break
+    if cut_temp is not None:
+        sp_post_vals_temp = sp_post_vals_temp[:cut_temp]
+        
+    if len(sp_post_vals_temp) < 3:
+        return None, "window_too_short"
+        
+    settled_start_temp = max(0, int(0.7 * len(sp_post_vals_temp)))
+    sp_post_temp = float(np.mean(sp_post_vals_temp[settled_start_temp:]))
+    amp_temp = sp_post_temp - sp_pre
+    
+    # 5% deflection transition start detection
+    idx_5pct = i_start
+    for idx in range(i_start, len(sp)):
+        if abs(sp[idx] - sp_pre) >= 0.05 * abs(amp_temp):
+            idx_5pct = idx
+            break
+    t0 = t[idx_5pct]
+
+    # Final post window definition
+    post_mask = t >= t0
+    sp_post_vals = sp[post_mask]
+    act_post_vals = act[post_mask]
+    t_post_vals = t[post_mask]
+    
+    if len(sp_post_vals) < 8:
+        return None, "window_too_short"
+
+    # 50% decay pulse-width window truncation
+    abs_deflections = np.abs(sp_post_vals - sp_pre)
+    idx_peak = int(np.argmax(abs_deflections))
+    peak_def = abs_deflections[idx_peak]
+    
+    cut = None
+    for idx in range(idx_peak, len(abs_deflections)):
+        if abs_deflections[idx] < 0.5 * peak_def:
+            cut = idx
+            break
+            
+    if cut is not None:
+        sp_post_vals = sp_post_vals[:cut]
+        act_post_vals = act_post_vals[:cut]
+        t_post_vals = t_post_vals[:cut]
+        
+    if len(sp_post_vals) < 8:
+        return None, "window_too_short"
+
+    # Find where the setpoint deflection drops below 90% of peak deflection after the peak
+    # to isolate the plateau from any return-to-zero decay
+    abs_deflections = np.abs(sp_post_vals - sp_pre)
+    idx_decay_start = len(abs_deflections)
+    for idx in range(idx_peak, len(abs_deflections)):
+        if abs_deflections[idx] < 0.90 * peak_def:
+            idx_decay_start = idx
+            break
+
+    # Standard 30% settled plateau average calculated over the plateau region
+    plateau_len = idx_decay_start - idx_peak
+    settled_start_idx = idx_peak + max(0, int(0.7 * plateau_len))
+    sp_post = float(np.mean(sp_post_vals[settled_start_idx:max(settled_start_idx + 1, idx_decay_start)]))
+    amp = sp_post - sp_pre
+
+    # Ensure sp_post is a meaningful step away from sp_pre
+    if abs(amp) < 0.8 * min_amp:
+        return None, "too_small"
+        
+    # Use stable early portion for initial amplitude in the ramp check
+    stable_start_t = t0 + 0.1
+    stable_end_t = t0 + 0.3
+    stable_idx = (t_post_vals >= stable_start_t) & (t_post_vals < stable_end_t)
+    if stable_idx.sum() >= 5:
+        sp_early = float(np.mean(sp_post_vals[stable_idx]))
+    else:
+        sp_early = float(np.mean(sp_post_vals[:max(1, len(sp_post_vals)//4)]))
+    amp_initial = sp_early - sp_pre
+
+    # Circularity-safe reference amp ramp check:
+    pre_span = np.ptp(sp[pre_mask]) if pre_mask.sum() > 2 else 0.0
+    reference_amp = max(abs(amp_initial), pre_span + min_amp)
+    post_sp_std = np.std(sp_post_vals)
+    
+    if post_sp_std > 0.7 * reference_amp:
+        return None, "ramp"
+
+    # SNR gate:
+    act_noise = float(np.std(act[pre_mask])) or 1e-6
+    if abs(amp) < 2.0 * act_noise:
+        return None, "snr"
+        
+    noise_ratio = act_noise / abs(amp)
+
+    # Oscillation window
+    osc_mask = (t >= t0) & (t <= t0 + 2.0)
+    osc_act = act[osc_mask]
+    if len(osc_act) < int(1.0 * _RESAMPLE_HZ):
+        oscillations = None
+    else:
+        # Zero crossings of osc_act relative to sp_post
+        resid = osc_act - sp_post
+        crossing_noise = min(act_noise, 0.03) if act_noise > 0.05 else act_noise
+        sig = resid[np.abs(resid) > max(0.03 * abs(amp), 2 * crossing_noise, 0.02)]
+        crossings = int(np.count_nonzero(np.diff(np.sign(sig)) != 0)) if sig.size > 1 else 0
+        oscillations = crossings
+
+    ta, aa = t_post_vals, act_post_vals
+    sign = 1.0 if amp > 0 else -1.0
+
+    # Check that we started below the 63.2% threshold relative to the step direction
+    started_below = sign * (aa[0] - (sp_pre + 0.632 * amp)) < 0
+    crossed = sign * (aa - (sp_pre + 0.632 * amp)) >= 0
+    crossed_90 = sign * (aa - (sp_pre + 0.90 * amp)) >= 0
+
+    post_duration = float(ta[-1] - t0) if len(ta) > 0 else 0.0
+
+    if started_below and crossed.any() and crossed_90.any():
+        tau = float(ta[np.argmax(crossed)] - t0)
+        plateau_duration_ok = post_duration >= 4 * tau
+    elif not started_below:
+        # Instantaneous/very fast response
+        tau = 0.0
+        plateau_duration_ok = True
+    else:
+        tau = None
+        plateau_duration_ok = False
+
+    peak = float(np.max(sign * (aa - sp_post)))
+    overshoot = max(0.0, peak / abs(amp))
+
+    outside = np.abs(aa - sp_post) > _SETTLE_BAND * abs(amp)
+    if np.all(outside):
+        settling = None
+        settled = False
+    else:
+        settling = float(ta[np.where(outside)[0][-1]] - t0) if outside.any() else 0.0
+        settled = not bool(outside[-1])
+
+    ramped_input = not plateau_duration_ok
+    limitations = None
+    if ramped_input:
+        limitations = "short pulse/ramp — τ & overshoot may be unreliable"
+
+    pre_step_motion = noise_ratio > 0.15
+    short_post_window = post_duration < 1.0
+    osc_reliable = post_duration >= 1.0 and oscillations is not None
+    
+    score = 1.0
+    if noise_ratio > 0.25:
+        score = min(score, 0.3)
+    elif noise_ratio > 0.15:
+        score = min(score, 0.6)
+        
+    if ramped_input:
+        score = min(score, 0.8)
+        
+    if short_post_window:
+        score = min(score, 0.7)
+        
+    if derived:
+        score = min(score, 0.5)
+        
+    confidence = {
+        "score": score,
+        "flags": {
+            "pre_step_motion": pre_step_motion,
+            "ramped_input": ramped_input,
+            "low_coherence": False, # filled at axis level
+            "short_post_window": short_post_window,
+            "derived_from_attitude": derived,
+            "osc_reliable": osc_reliable,
+        }
+    }
+
+    res_dict = {
+        "tau_s": round(tau, 3) if tau is not None else None,
+        "settling_s": round(settling, 3) if settled else None,
+        "overshoot": round(overshoot, 3),
+        "oscillations": oscillations,
+        "step_amp_deg_s": round(math.degrees(amp), 1),
+        "amplitude": amp,
+        "post_sp_std": post_sp_std,
+        "ramped_input": ramped_input,
+        "limitations": limitations,
+        "noise_ratio": noise_ratio,
+        "t_start": float(t_start),
+        "confidence": confidence,
+        "t0": float(t0),
+        "sp_pre": float(sp_pre),
+        "plateau_duration_ok": plateau_duration_ok,
+    }
+    return res_dict, None
+
+
+def _analyze_axis(t: np.ndarray, sp: np.ndarray, act: np.ndarray,
+                  step_mask: np.ndarray | None = None,
+                  derived: bool = False,
+                  axis: str = "roll") -> dict:
     taus, settlings, overshoots = [], [], []
     win_sp, win_act = [], []
+    step_results = []
+    step_results_full = []
 
-    indices = _find_step_indices(sp)
+    if "(body)" in axis:
+        min_amp = 0.087
+    else:
+        min_amp = _STEP_MIN_RAD_S_YAW if "yaw" in axis else _STEP_MIN_RAD_S
+
+    indices = _find_step_indices(sp, threshold=min_amp)
     if step_mask is not None:
         indices = [i for i in indices if step_mask[i]]
 
-    for i in indices:
-        lo, hi = max(0, i - pre), min(len(sp), i + post)
-        if hi - lo < pre + post // 2:
-            continue
-        res = LivePidEngine._step_response(t[lo:hi], sp[lo:hi], act[lo:hi])
-        if res is None:
-            continue
-        if res["tau_s"] is not None:
-            taus.append(res["tau_s"])
-        if res["settling_s"] is not None:
-            settlings.append(res["settling_s"])
-        overshoots.append(res["overshoot"])
-        win_sp.append(sp[lo:hi])
-        win_act.append(act[lo:hi])
+    rej_counts = {"window_too_short": 0, "level_change": 0, "snr": 0, "ramp": 0, "too_small": 0}
+    candidates_count = len(indices)
+    last_step_t = None
 
-    out: dict = {"n_steps": len(overshoots)}
+    for i in indices:
+        slice_pre = int(1.5 * _RESAMPLE_HZ)
+        slice_post = int(2.5 * _RESAMPLE_HZ)
+        lo, hi = max(0, i - slice_pre), min(len(sp), i + slice_post)
+        
+        res, reason = _step_response_offline(
+            t[lo:hi], sp[lo:hi], act[lo:hi],
+            min_amp=min_amp,
+            last_step_t=last_step_t,
+            derived=derived
+        )
+        
+        last_step_t = float(t[i])
+        
+        if res is None:
+            if reason in rej_counts:
+                rej_counts[reason] += 1
+            continue
+            
+        step_results_full.append(res)
+        step_results.append({
+            "t": t[lo:hi].tolist(),
+            "sp": sp[lo:hi].tolist(),
+            "act": act[lo:hi].tolist(),
+            "tau_s": res["tau_s"],
+            "overshoot": res["overshoot"],
+            "oscillations": res["oscillations"],
+            "settling_s": res["settling_s"],
+            "amplitude": res["amplitude"],
+            "ramped_input": res["ramped_input"],
+            "noise_ratio": res["noise_ratio"],
+            "confidence": res["confidence"],
+            "t0": res["t0"],
+            "sp_pre": res["sp_pre"],
+            "plateau_duration_ok": res["plateau_duration_ok"],
+        })
+        
+        if res.get("plateau_duration_ok", True):
+            if res["tau_s"] is not None:
+                taus.append(res["tau_s"])
+            if res["settling_s"] is not None:
+                settlings.append(res["settling_s"])
+            overshoots.append(res["overshoot"])
+            win_sp.append(sp[lo:hi])
+            win_act.append(act[lo:hi])
+
+    coherence = compute_coherence_in_band(t, sp, act)
+    low_coherence = coherence < 0.6 if coherence is not None else False
+    fd_gain = compute_fd_gain(t, sp, act)
+
+    out: dict = {
+        "n_steps": len(step_results),
+        "n_steps_time_domain": len(overshoots),
+        "candidates": candidates_count,
+        "rejections": rej_counts,
+        "steps": step_results,
+        "derived_from_attitude": derived,
+        "coherence": round(coherence, 3) if coherence is not None else None,
+        "fd_gain": round(fd_gain, 3) if fd_gain is not None else None,
+    }
+    
+    # Aggregate step flags:
+    pre_step_motion = False
+    ramped_input = False
+    short_post_window = False
+    osc_reliable = False
+    
+    if step_results_full:
+        pre_step_motion = any(s["confidence"]["flags"]["pre_step_motion"] for s in step_results_full)
+        ramped_input = any(s["confidence"]["flags"]["ramped_input"] for s in step_results_full)
+        short_post_window = any(s["confidence"]["flags"]["short_post_window"] for s in step_results_full)
+        osc_reliable = any(s["confidence"]["flags"]["osc_reliable"] for s in step_results_full)
+        
+        # Calculate axis score using min-of-components:
+        score = 1.0
+        if low_coherence:
+            score = min(score, 0.5)
+        
+        max_nr = max(s.get("noise_ratio", 0.0) for s in step_results_full)
+        if max_nr > 0.25:
+            score = min(score, 0.3)
+        elif max_nr > 0.15:
+            score = min(score, 0.6)
+            
+        if ramped_input:
+            score = min(score, 0.8)
+            
+        if short_post_window:
+            score = min(score, 0.7)
+            
+        if derived:
+            score = min(score, 0.5)
+    else:
+        score = max(0.0, min(1.0, coherence)) if coherence is not None else 0.0
+
+    confidence = {
+        "score": round(score, 2),
+        "flags": {
+            "pre_step_motion": pre_step_motion,
+            "ramped_input": ramped_input,
+            "low_coherence": low_coherence,
+            "short_post_window": short_post_window,
+            "derived_from_attitude": derived,
+            "osc_reliable": osc_reliable,
+        }
+    }
+    out["confidence"] = confidence
+
     if not overshoots:
+        out.update({
+            "tau_s_median": None,
+            "settling_s_median": None,
+            "overshoot_max": None,
+            "r": None,
+            "nrmse": None,
+        })
         return out
 
     # Pearson/NRMSE over maneuver windows only — including quiet hover
@@ -130,56 +582,164 @@ def _suggest(axis: str, stats: dict, airframe_class: str | None,
     recs: list[dict] = []
     notes: list[str] = []
 
-    if stats.get("n_steps", 0) == 0:
-        notes.append(f"{axis}: no usable step maneuvers in this log — fly "
-                     f"sharp alternating {axis} inputs to enable analysis.")
-        return recs, notes
+    # Get details
+    loop_type = "rate"
+    base_axis = axis
+    if " (rate)" in axis:
+        base_axis = axis.replace(" (rate)", "")
+        loop_type = "rate"
+    elif " (body)" in axis:
+        base_axis = axis.replace(" (body)", "")
+        loop_type = "body"
 
-    param = _RATE_P_PARAM.get(airframe_class or "", {}).get(axis)
-    current = params.get(param) if param else None
-    r = stats.get("r")
-    tau, settling = stats.get("tau_s_median"), stats.get("settling_s_median")
-    overshoot = stats.get("overshoot_max", 0.0)
-
-    if r is not None and r < _R_DEPLETION:
-        # Authority problem — gain changes would be treating the symptom.
-        notes.append(
-            f"{axis}: tracking correlation r={r:.2f} (<{_R_DEPLETION}) across "
-            f"maneuvers. Check the actuator-saturation and vibration sections "
-            f"before touching gains.")
-        return recs, notes
-
-    if param is None or current is None:
-        notes.append(f"{axis}: stats computed but no tunable rate-P parameter "
-                     f"resolved for airframe class {airframe_class}.")
-        return recs, notes
-
-    is_ff = "FF" in param
-    is_fw_yaw = (airframe_class in ("FIXED_WING", "DELTA_WING") and axis == "yaw")
-    damping_note = "" if (is_ff or is_fw_yaw) else " (or raise rate D)"
-
-    if overshoot > _OVERSHOOT_LIMIT:
-        recs.append({
-            "param": param,
-            "proposed_value": round(float(current) * (1 - _GAIN_TRIM), 4),
-            "rationale": (
-                f"{axis} overshoot peaked at {overshoot*100:.0f}% of step "
-                f"amplitude across {stats['n_steps']} maneuvers "
-                f"(τ={tau}s). Reduce {param} ~{int(_GAIN_TRIM*100)}%{damping_note} "
-                f"to damp the response."),
-        })
-    elif tau is not None and settling is not None and settling > 4 * tau:
-        recs.append({
-            "param": param,
-            "proposed_value": round(float(current) * (1 + _GAIN_TRIM), 4),
-            "rationale": (
-                f"{axis} settles in {settling}s vs τ={tau}s (>{4}×τ) — "
-                f"under-tuned. Increase {param} ~{int(_GAIN_TRIM*100)}% and "
-                f"re-fly the test."),
-        })
+    if loop_type == "body":
+        param = _ATTITUDE_PARAM.get(airframe_class or "", {}).get(base_axis)
     else:
-        notes.append(f"{axis}: tracking healthy (r={r}, τ={tau}s, "
-                     f"overshoot {overshoot*100:.0f}%) — no change advised.")
+        param = _RATE_P_PARAM.get(airframe_class or "", {}).get(base_axis)
+        
+    current = params.get(param) if param else None
+    
+    n_steps = stats.get("n_steps", 0)
+    n_steps_td = stats.get("n_steps_time_domain", 0)
+    coherence = stats.get("coherence")
+    fd_gain = stats.get("fd_gain")
+    coherence_ok = coherence is not None and coherence > 0.6
+
+    candidates = stats.get("candidates", 0)
+    # If there are candidates but all were rejected, show the rejections accounting note
+    if n_steps == 0 and candidates > 0:
+        rejections = stats.get("rejections", {})
+        derived_str = " (derived from attitude)" if stats.get("derived_from_attitude") else ""
+        parts = []
+        if rejections.get("too_small", 0) > 0:
+            parts.append(f"{rejections['too_small']} too small")
+        if rejections.get("snr", 0) > 0:
+            parts.append(f"{rejections['snr']} noisy/low SNR")
+        if rejections.get("ramp", 0) > 0:
+            parts.append(f"{rejections['ramp']} slow/ramped")
+        
+        window_count = rejections.get("window_too_short", 0) + rejections.get("window", 0)
+        if window_count > 0:
+            parts.append(f"{window_count} window too short")
+        if rejections.get("level_change", 0) > 0:
+            parts.append(f"{rejections['level_change']} level change")
+            
+        if not parts:
+            parts.append("rejected")
+            
+        reason_msg = ", ".join(parts)
+        notes.append(
+            f"{axis}: {candidates} step candidates detected{derived_str} but all were rejected, "
+            f"predominantly because they were {reason_msg}. "
+            f"Ensure inputs are sharp, distinct, and performed from a steady hover/flight state."
+        )
+        return recs, notes
+
+    # If no steps were reliable for time-domain and coherence is low, report that coherence is too low
+    if n_steps_td == 0 and not coherence_ok:
+        coherence_val = f"{coherence:.2f}" if coherence is not None else "N/A"
+        notes.append(f"{axis}: No steps detected. Coherence too low ({coherence_val} ≤ 0.6). Fly sharp inputs or use Live Dashboard.")
+        return recs, notes
+
+    # Inform the user when frequency fallback is used due to step details
+    if n_steps == 0 and coherence_ok:
+        notes.append(f"{axis}: no step maneuvers detected — frequency-domain fallback used for gain advice. Fly sharp alternating {axis} inputs to enable step-response envelope plots.")
+    elif n_steps > 0 and n_steps_td == 0:
+        notes.append(f"{axis}: steps were too short/pulsed to reliably measure overshoot and settling in the time domain. Suggest frequency analysis for overshoot.")
+
+    # 2. Process recommendations
+    if n_steps_td > 0:
+        # Standard time-domain analysis path
+        r = stats.get("r")
+        if r is not None and r < _R_DEPLETION:
+            notes.append(
+                f"{axis}: tracking correlation r={r:.2f} (<{_R_DEPLETION}) across "
+                f"maneuvers. Check the actuator-saturation and vibration sections "
+                f"before touching gains.")
+            return recs, notes
+
+        if param is None or current is None:
+            notes.append(f"{axis}: stats computed but no tunable parameter "
+                         f"resolved for airframe class {airframe_class}.")
+            return recs, notes
+
+        tau, settling = stats.get("tau_s_median"), stats.get("settling_s_median")
+        overshoot = stats.get("overshoot_max", 0.0)
+        is_time_constant = param.endswith("_TC")
+
+        if overshoot > _OVERSHOOT_LIMIT:
+            if is_time_constant:
+                proposed = round(float(current) + 0.05, 3)
+                rationale = f"{axis} overshoot peaked at {overshoot*100:.0f}% — slow down by raising time constant."
+            else:
+                proposed = round(float(current) * (1 - _GAIN_TRIM), 4)
+                rationale = f"{axis} overshoot peaked at {overshoot*100:.0f}% of step amplitude — soften the P gain."
+                
+            recs.append({
+                "param": param,
+                "proposed_value": proposed,
+                "rationale": rationale,
+                "confidence": stats.get("confidence"),
+            })
+        elif tau is not None and settling is not None and settling > 4 * tau:
+            if is_time_constant:
+                proposed = round(max(0.1, float(current) - 0.05), 3)
+                rationale = f"{axis} settles in {settling}s vs τ={tau}s — speed up by tightening time constant."
+            else:
+                proposed = round(float(current) * (1 + _GAIN_TRIM), 4)
+                rationale = f"{axis} settles in {settling}s vs τ={tau}s (>{4}×τ) — raise the P gain."
+                
+            recs.append({
+                "param": param,
+                "proposed_value": proposed,
+                "rationale": rationale,
+                "confidence": stats.get("confidence"),
+            })
+        else:
+            notes.append(f"{axis}: tracking healthy (r={r}, τ={tau}s, "
+                         f"overshoot {overshoot*100:.0f}%) — no change advised.")
+    else:
+        # Fallback frequency-domain gain path
+        if coherence_ok:
+            if fd_gain is not None:
+                if param is None or current is None:
+                    notes.append(f"{axis}: frequency-domain analysis computed (gain={fd_gain:.2f}) but no tunable parameter resolved for airframe class {airframe_class}.")
+                    return recs, notes
+
+                is_time_constant = param.endswith("_TC")
+                if fd_gain < 0.85:
+                    if is_time_constant:
+                        proposed = round(max(0.1, float(current) - 0.05), 3)
+                        rationale = f"{axis} low-frequency gain is sluggish ({fd_gain:.2f} < 0.85) — speed up by lowering time constant."
+                    else:
+                        proposed = round(float(current) * (1 + _GAIN_TRIM), 4)
+                        rationale = f"{axis} low-frequency gain is sluggish ({fd_gain:.2f} < 0.85) — raise the P gain."
+                    
+                    recs.append({
+                        "param": param,
+                        "proposed_value": proposed,
+                        "rationale": rationale,
+                        "confidence": stats.get("confidence"),
+                    })
+                elif fd_gain > 1.15:
+                    if is_time_constant:
+                        proposed = round(float(current) + 0.05, 3)
+                        rationale = f"{axis} low-frequency gain is elevated ({fd_gain:.2f} > 1.15) — slow down by raising time constant."
+                    else:
+                        proposed = round(float(current) * (1 - _GAIN_TRIM), 4)
+                        rationale = f"{axis} low-frequency gain is elevated ({fd_gain:.2f} > 1.15) — soften the P gain."
+                    
+                    recs.append({
+                        "param": param,
+                        "proposed_value": proposed,
+                        "rationale": rationale,
+                        "confidence": stats.get("confidence"),
+                    })
+                else:
+                    notes.append(f"{axis}: frequency-domain tracking healthy (gain={fd_gain:.2f}, coherence={coherence:.2f}) — no change advised.")
+            else:
+                notes.append(f"{axis}: no step maneuvers detected and frequency-domain gain could not be computed.")
+
     return recs, notes
 
 
@@ -189,8 +749,10 @@ def analyze_pid(rates_sp: pd.DataFrame | None,
                 params: dict,
                 airframe_class: str | None,
                 status: pd.DataFrame | None = None,
-                vtol_status: pd.DataFrame | None = None) -> dict:
-    """Full-log rate-tracking analysis. Returns per-axis stats + proposals."""
+                vtol_status: pd.DataFrame | None = None,
+                att_sp: pd.DataFrame | None = None,
+                vehicle_att: pd.DataFrame | None = None) -> dict:
+    """Full-log rate-tracking and attitude-tracking analysis. Returns per-axis stats + proposals."""
     if rates_sp is None:
         return {"skipped": "vehicle_rates_setpoint not logged — enable a "
                            "higher logging profile (SDLOG_PROFILE) for PID analysis"}
@@ -208,75 +770,218 @@ def analyze_pid(rates_sp: pd.DataFrame | None,
     notes: list[str] = []
 
     for axis in ("roll", "pitch", "yaw"):
-        sp_u = _uniform(rates_sp, _SP_COLS[axis])
-        act_u = _uniform(act_source, act_cols[axis])
-        if sp_u is None or act_u is None:
-            axes[axis] = {"n_steps": 0}
-            continue
-        # Overlap the two grids.
-        t0 = max(sp_u[0][0], act_u[0][0])
-        t1 = min(sp_u[0][-1], act_u[0][-1])
-        grid = np.arange(t0, t1, 1.0 / _RESAMPLE_HZ)
-        if len(grid) < 200:
-            axes[axis] = {"n_steps": 0}
-            continue
-        sp = np.interp(grid, *sp_u)
-        act = np.interp(grid, *act_u)
+        # --- 1. Rate Loop ---
+        rate_axis = f"{axis} (rate)"
+        sp_u_rate = _uniform(rates_sp, _SP_COLS[axis])
+        act_u_rate = _uniform(act_source, act_cols[axis])
 
-        # Build grid_vtype to classify steps
-        grid_vtype = None
-        if status is not None and "vehicle_type" in status.columns:
-            # vehicle_status timestamps are in microseconds
-            t_status = status["timestamp"].to_numpy(np.float64) / 1e6
-            vtype = status["vehicle_type"].to_numpy(np.float64)
-            if len(t_status) > 0:
-                grid_vtype = np.round(np.interp(grid, t_status, vtype))
-        elif vtol_status is not None and "vtol_in_rw_mode" in vtol_status.columns:
-            t_vtol = vtol_status["timestamp"].to_numpy(np.float64) / 1e6
-            rw_mode = vtol_status["vtol_in_rw_mode"].to_numpy(np.float64)
-            if len(t_vtol) > 0:
-                # rw_mode is True (1) in hover/MC, False (0) in forward-flight/FW
-                vtype = np.where(rw_mode > 0.5, 1.0, 2.0)
-                grid_vtype = np.round(np.interp(grid, t_vtol, vtype))
+        derived_rate = False
+        has_data_rate = (sp_u_rate is not None and act_u_rate is not None)
 
-        if airframe_class == "VTOL":
-            # VTOL splits into Rotary-wing (1) and Fixed-wing (2)
-            if grid_vtype is None:
-                notes.append("VTOL split failed (no vehicle_status or vtol_vehicle_status data). Treating all steps as MC-only.")
-                mc_mask = None
-                fw_mask = np.zeros_like(grid, dtype=bool)
+        if axis == "yaw" and att_sp is not None:
+            need_fallback = not has_data_rate
+            if has_data_rate:
+                t0 = max(sp_u_rate[0][0], act_u_rate[0][0])
+                t1 = min(sp_u_rate[0][-1], act_u_rate[0][-1])
+                grid = np.arange(t0, t1, 1.0 / _RESAMPLE_HZ)
+                if len(grid) >= 200:
+                    sp_dry = np.interp(grid, *sp_u_rate)
+                    if airframe_class == "VTOL":
+                        grid_vtype = None
+                        if status is not None and "vehicle_type" in status.columns:
+                            t_status = status["timestamp"].to_numpy(np.float64) / 1e6
+                            vtype = status["vehicle_type"].to_numpy(np.float64)
+                            if len(t_status) > 0:
+                                grid_vtype = np.round(np.interp(grid, t_status, vtype))
+                        elif vtol_status is not None and "vtol_in_rw_mode" in vtol_status.columns:
+                            t_vtol = vtol_status["timestamp"].to_numpy(np.float64) / 1e6
+                            rw_mode = vtol_status["vtol_in_rw_mode"].to_numpy(np.float64)
+                            if len(t_vtol) > 0:
+                                vtype = np.where(rw_mode > 0.5, 1.0, 2.0)
+                                grid_vtype = np.round(np.interp(grid, t_vtol, vtype))
+
+                        if grid_vtype is None:
+                            mc_mask = None
+                            fw_mask = np.zeros_like(grid, dtype=bool)
+                        else:
+                            mc_mask = (grid_vtype == 1)
+                            fw_mask = (grid_vtype == 2)
+
+                        mc_indices = _find_step_indices(sp_dry, threshold=_STEP_MIN_RAD_S_YAW)
+                        if mc_mask is not None:
+                            mc_indices = [idx for idx in mc_indices if mc_mask[idx]]
+                        fw_indices = _find_step_indices(sp_dry, threshold=_STEP_MIN_RAD_S_YAW)
+                        if fw_mask is not None:
+                            fw_indices = [idx for idx in fw_indices if fw_mask[idx]]
+
+                        n_steps = len(mc_indices) + len(fw_indices)
+                    else:
+                        n_steps = len(_find_step_indices(sp_dry, threshold=_STEP_MIN_RAD_S_YAW))
+
+                    if n_steps < 3:
+                        need_fallback = True
+                else:
+                    need_fallback = True
+
+            if need_fallback:
+                att_euler = _extract_euler_angles(att_sp)
+                yaw_att = att_euler["yaw"] if att_euler is not None else None
+                if yaw_att is not None and len(att_sp) >= 10:
+                    t_att = att_sp["timestamp"].to_numpy(np.float64) / 1e6
+                    yaw_unwrapped = np.unwrap(yaw_att)
+                    grid_att = np.arange(t_att[0], t_att[-1], 1.0 / _RESAMPLE_HZ)
+                    if len(grid_att) >= 10:
+                        yaw_uniform = np.interp(grid_att, t_att, yaw_unwrapped)
+                        yaw_rate = np.gradient(yaw_uniform, 1.0 / _RESAMPLE_HZ)
+                        sp_u_rate = (grid_att, yaw_rate)
+                        derived_rate = True
+                        has_data_rate = (act_u_rate is not None)
+
+        if has_data_rate:
+            t0 = max(sp_u_rate[0][0], act_u_rate[0][0])
+            t1 = min(sp_u_rate[0][-1], act_u_rate[0][-1])
+            grid = np.arange(t0, t1, 1.0 / _RESAMPLE_HZ)
+            if len(grid) >= 200:
+                sp = np.interp(grid, *sp_u_rate)
+                act = np.interp(grid, *act_u_rate)
+
+                grid_vtype = None
+                if status is not None and "vehicle_type" in status.columns:
+                    t_status = status["timestamp"].to_numpy(np.float64) / 1e6
+                    vtype = status["vehicle_type"].to_numpy(np.float64)
+                    if len(t_status) > 0:
+                        grid_vtype = np.round(np.interp(grid, t_status, vtype))
+                elif vtol_status is not None and "vtol_in_rw_mode" in vtol_status.columns:
+                    t_vtol = vtol_status["timestamp"].to_numpy(np.float64) / 1e6
+                    rw_mode = vtol_status["vtol_in_rw_mode"].to_numpy(np.float64)
+                    if len(t_vtol) > 0:
+                        vtype = np.where(rw_mode > 0.5, 1.0, 2.0)
+                        grid_vtype = np.round(np.interp(grid, t_vtol, vtype))
+
+                if airframe_class == "VTOL":
+                    if grid_vtype is None:
+                        notes.append(f"VTOL split failed (no vehicle_status or vtol_vehicle_status data). Treating all steps as MC-only for {rate_axis}.")
+                        mc_mask = None
+                        fw_mask = np.zeros_like(grid, dtype=bool)
+                    else:
+                        mc_mask = (grid_vtype == 1)
+                        fw_mask = (grid_vtype == 2)
+
+                    mc_stats = _analyze_axis(grid, sp, act, mc_mask, derived=derived_rate, axis=rate_axis)
+                    fw_stats = _analyze_axis(grid, sp, act, fw_mask, derived=derived_rate, axis=rate_axis)
+
+                    axes[rate_axis] = {
+                        "mc": mc_stats,
+                        "fw": fw_stats,
+                        "n_steps": mc_stats.get("n_steps", 0) + fw_stats.get("n_steps", 0)
+                    }
+                    mc_recs, mc_notes = _suggest(rate_axis, mc_stats, "MULTIROTOR", params)
+                    fw_recs, fw_notes = _suggest(rate_axis, fw_stats, "FIXED_WING", params)
+
+                    for r in mc_recs:
+                        r["rationale"] = f"MC mode: {r['rationale']}"
+                    for r in fw_recs:
+                        r["rationale"] = f"FW mode: {r['rationale']}"
+
+                    mc_notes = [f"{n.split(':', 1)[0]} (MC):{n.split(':', 1)[1]}" if ":" in n else f"(MC) {n}" for n in mc_notes]
+                    fw_notes = [f"{n.split(':', 1)[0]} (FW):{n.split(':', 1)[1]}" if ":" in n else f"(FW) {n}" for n in fw_notes]
+
+                    recommendations += mc_recs + fw_recs
+                    notes += mc_notes + fw_notes
+                else:
+                    stats = _analyze_axis(grid, sp, act, None, derived=derived_rate, axis=rate_axis)
+                    axes[rate_axis] = stats
+                    recs, axis_notes = _suggest(rate_axis, stats, airframe_class, params)
+                    recommendations += recs
+                    notes += axis_notes
             else:
-                mc_mask = (grid_vtype == 1)
-                fw_mask = (grid_vtype == 2)
-
-            mc_stats = _analyze_axis(grid, sp, act, mc_mask)
-            fw_stats = _analyze_axis(grid, sp, act, fw_mask)
-
-            axes[axis] = {
-                "mc": mc_stats,
-                "fw": fw_stats,
-                "n_steps": mc_stats.get("n_steps", 0) + fw_stats.get("n_steps", 0)
-            }
-            mc_recs, mc_notes = _suggest(axis, mc_stats, "MULTIROTOR", params)
-            fw_recs, fw_notes = _suggest(axis, fw_stats, "FIXED_WING", params)
-            
-            # Prefix VTOL suggestions/notes to differentiate MC and FW modes
-            for r in mc_recs:
-                r["rationale"] = f"MC mode: {r['rationale']}"
-            for r in fw_recs:
-                r["rationale"] = f"FW mode: {r['rationale']}"
-
-            mc_notes = [f"{n.split(':', 1)[0]} (MC):{n.split(':', 1)[1]}" if ":" in n else f"(MC) {n}" for n in mc_notes]
-            fw_notes = [f"{n.split(':', 1)[0]} (FW):{n.split(':', 1)[1]}" if ":" in n else f"(FW) {n}" for n in fw_notes]
-
-            recommendations += mc_recs + fw_recs
-            notes += mc_notes + fw_notes
+                axes[rate_axis] = {"n_steps": 0}
         else:
-            stats = _analyze_axis(grid, sp, act, None)
-            axes[axis] = stats
-            recs, axis_notes = _suggest(axis, stats, airframe_class, params)
-            recommendations += recs
-            notes += axis_notes
+            axes[rate_axis] = {"n_steps": 0}
+
+        # --- 2. Body Attitude Loop ---
+        body_axis = f"{axis} (body)"
+        has_data_body = False
+        if att_sp is not None and vehicle_att is not None:
+            att_sp_euler = _extract_euler_angles(att_sp)
+            vehicle_att_euler = _extract_euler_angles(vehicle_att)
+            if att_sp_euler is not None and vehicle_att_euler is not None:
+                att_sp_copy = att_sp.copy()
+                vehicle_att_copy = vehicle_att.copy()
+
+                # Unwrap all angles to prevent wrap-around boundary discontinuities
+                sp_angles = np.unwrap(att_sp_euler[axis])
+                act_angles = np.unwrap(vehicle_att_euler[axis])
+
+                att_sp_copy["euler_angle"] = sp_angles
+                vehicle_att_copy["euler_angle"] = act_angles
+
+                sp_u_body = _uniform(att_sp_copy, "euler_angle")
+                act_u_body = _uniform(vehicle_att_copy, "euler_angle")
+
+                has_data_body = (sp_u_body is not None and act_u_body is not None)
+
+        if has_data_body:
+            t0 = max(sp_u_body[0][0], act_u_body[0][0])
+            t1 = min(sp_u_body[0][-1], act_u_body[0][-1])
+            grid = np.arange(t0, t1, 1.0 / _RESAMPLE_HZ)
+            if len(grid) >= 200:
+                sp = np.interp(grid, *sp_u_body)
+                act = np.interp(grid, *act_u_body)
+
+                grid_vtype = None
+                if status is not None and "vehicle_type" in status.columns:
+                    t_status = status["timestamp"].to_numpy(np.float64) / 1e6
+                    vtype = status["vehicle_type"].to_numpy(np.float64)
+                    if len(t_status) > 0:
+                        grid_vtype = np.round(np.interp(grid, t_status, vtype))
+                elif vtol_status is not None and "vtol_in_rw_mode" in vtol_status.columns:
+                    t_vtol = vtol_status["timestamp"].to_numpy(np.float64) / 1e6
+                    rw_mode = vtol_status["vtol_in_rw_mode"].to_numpy(np.float64)
+                    if len(t_vtol) > 0:
+                        vtype = np.where(rw_mode > 0.5, 1.0, 2.0)
+                        grid_vtype = np.round(np.interp(grid, t_vtol, vtype))
+
+                if airframe_class == "VTOL":
+                    if grid_vtype is None:
+                        notes.append(f"VTOL split failed (no vehicle_status or vtol_vehicle_status data). Treating all steps as MC-only for {body_axis}.")
+                        mc_mask = None
+                        fw_mask = np.zeros_like(grid, dtype=bool)
+                    else:
+                        mc_mask = (grid_vtype == 1)
+                        fw_mask = (grid_vtype == 2)
+
+                    mc_stats = _analyze_axis(grid, sp, act, mc_mask, derived=False, axis=body_axis)
+                    fw_stats = _analyze_axis(grid, sp, act, fw_mask, derived=False, axis=body_axis)
+
+                    axes[body_axis] = {
+                        "mc": mc_stats,
+                        "fw": fw_stats,
+                        "n_steps": mc_stats.get("n_steps", 0) + fw_stats.get("n_steps", 0)
+                    }
+                    mc_recs, mc_notes = _suggest(body_axis, mc_stats, "MULTIROTOR", params)
+                    fw_recs, fw_notes = _suggest(body_axis, fw_stats, "FIXED_WING", params)
+
+                    for r in mc_recs:
+                        r["rationale"] = f"MC mode: {r['rationale']}"
+                    for r in fw_recs:
+                        r["rationale"] = f"FW mode: {r['rationale']}"
+
+                    mc_notes = [f"{n.split(':', 1)[0]} (MC):{n.split(':', 1)[1]}" if ":" in n else f"(MC) {n}" for n in mc_notes]
+                    fw_notes = [f"{n.split(':', 1)[0]} (FW):{n.split(':', 1)[1]}" if ":" in n else f"(FW) {n}" for n in fw_notes]
+
+                    recommendations += mc_recs + fw_recs
+                    notes += mc_notes + fw_notes
+                else:
+                    stats = _analyze_axis(grid, sp, act, None, derived=False, axis=body_axis)
+                    axes[body_axis] = stats
+                    recs, axis_notes = _suggest(body_axis, stats, airframe_class, params)
+                    recommendations += recs
+                    notes += axis_notes
+            else:
+                axes[body_axis] = {"n_steps": 0}
+        else:
+            axes[body_axis] = {"n_steps": 0}
 
     return {
         "airframe_class": airframe_class,

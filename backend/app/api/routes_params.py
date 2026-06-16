@@ -45,9 +45,6 @@ class TuningWindowRequest(BaseModel):
     loop: str = Field(..., pattern="^(rate|attitude|velocity|position)$")
 
 
-class FeedbackRequest(BaseModel):
-    outcome: str = Field(..., pattern="^(better|worse|no_change|skip|no_feedback)$",
-                         examples=["better"])
 
 
 @router.get("/safety-registry")
@@ -121,21 +118,6 @@ async def revert_proposal(proposal_id: str) -> dict:
             "safety_note": prop.safety_note}
 
 
-@router.post("/proposals/{proposal_id}/feedback")
-def proposal_feedback(proposal_id: str, req: FeedbackRequest) -> dict:
-    """Record the pilot's verdict on a written change (better/worse/no_change).
-
-    Persists to the tuning memory so future proposals for the same airframe/
-    param/direction can show the track record. Advisory only — never alters
-    the safety bounds or auto-applies anything.
-    """
-    try:
-        prop = ADVISOR.record_feedback(proposal_id, req.outcome)
-    except KeyError as exc:
-        raise HTTPException(404, str(exc))
-    except ValueError as exc:
-        raise HTTPException(409, str(exc))
-    return {"id": prop.id, "feedback": prop.feedback}
 
 
 @router.delete("/proposals/{proposal_id}")

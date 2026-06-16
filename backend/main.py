@@ -12,6 +12,7 @@ import logging
 import webbrowser
 from contextlib import asynccontextmanager
 
+import asyncio
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -52,9 +53,19 @@ async def lifespan(app: FastAPI):
     VTOL_MONITOR.start()
     CASCADE.start()
     VIB_GATE.start()
-    ADVISOR.start()
+    async def _loop_latency_monitor():
+        import time
+        while True:
+            t0 = time.monotonic()
+            await asyncio.sleep(0.1)
+            dt = time.monotonic() - t0 - 0.1
+            if dt > 0.15:
+                logging.getLogger("mint.perf").warning("FastAPI event loop blocked for %.1f ms", dt * 1000)
+
+    latency_task = asyncio.create_task(_loop_latency_monitor(), name="latency-monitor")
     log.info("Analysis engines online. UI at http://%s:%s", config.HTTP_HOST, config.HTTP_PORT)
     yield
+    latency_task.cancel()
     # Orderly teardown: vehicle link first, then the router subprocess.
     await CONNECTION.disconnect()
     await ROUTER.stop()

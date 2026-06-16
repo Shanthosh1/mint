@@ -34,6 +34,7 @@ _CLIP_WINDOW_S = config.VIB_CLIP_WINDOW_S
 _ALERT_COOLDOWN_S = config.VIB_ALERT_COOLDOWN_S
 _STALE_S = config.VIB_STALE_S
 _NEVER_STREAMED_S = config.VIB_NEVER_STREAMED_S
+_JUST_CLEARED_WINDOW_S = 1.5
 
 
 class VibrationGate:
@@ -90,20 +91,24 @@ class VibrationGate:
         return current_ok
 
     def just_cleared(self) -> bool:
-        """Returns True for 3 seconds after ok() transitions from False to True."""
+        """Returns True for _JUST_CLEARED_WINDOW_S seconds after ok() transitions from False to True."""
         now = time.monotonic()
         self.ok()
-        return now - self._last_cleared_time < 3.0
+        return now - self._last_cleared_time < _JUST_CLEARED_WINDOW_S
 
     # ------------------------------------------------------------------ #
     async def _run(self) -> None:
-        async for event in HUB.subscribe():
+        async for event in HUB.subscribe(channels=frozenset({
+            "connection", "vibration"
+        })):
             if event.channel == "connection":
                 if event.payload.get("connected"):
                     # Reset state on new connection
                     self._ever_seen = False
                     self._last_seen = 0.0
                     self._latest = {}
+                    self._last_ok_val = True
+                    self._last_cleared_time = 0.0
                     if hasattr(self, "_watchdog_task") and self._watchdog_task:
                         self._watchdog_task.cancel()
                     self._watchdog_task = asyncio.create_task(self._missing_vibration_watchdog(), name="vibration-watchdog")

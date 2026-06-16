@@ -110,14 +110,6 @@ if _tmp_dir_str.startswith("~"):
 else:
     ULOG_TMP_DIR = Path(_tmp_dir_str)
 
-# ---------------------------------------------------------------------------
-# Tuning feedback memory
-# ---------------------------------------------------------------------------
-_tuning_history_str = _get_val("tuning_history.path", str(Path.home() / ".mint" / "tuning_history.jsonl"))
-if _tuning_history_str.startswith("~"):
-    TUNING_HISTORY_PATH = Path(os.path.expanduser(_tuning_history_str))
-else:
-    TUNING_HISTORY_PATH = Path(_tuning_history_str)
 
 # ---------------------------------------------------------------------------
 # Expert Mode Settings
@@ -170,8 +162,8 @@ STICK_RAIL_WINDOW_S = float(_get_val("analysis.stick_monitor.rail_window_s", 30.
 STICK_RAIL_FRACTION = float(_get_val("analysis.stick_monitor.rail_fraction", 0.2))
 STICK_RAIL_MIN_SAMPLES = int(_get_val("analysis.stick_monitor.rail_min_samples", 50))
 STICK_VARIANCE_FLOOR = float(_get_val("analysis.stick_monitor.variance_floor", 25.0))
-STICK_COMPLIANCE_PEAK = float(_get_val("analysis.stick_monitor.compliance_peak", 400.0))
-STICK_COMPLIANCE_REVERSALS = int(_get_val("analysis.stick_monitor.compliance_reversals", 3))
+STICK_COMPLIANCE_PEAK = float(_get_val("analysis.stick_monitor.compliance_peak", 300.0))
+STICK_COMPLIANCE_REVERSALS = int(_get_val("analysis.stick_monitor.compliance_reversals", 2))
 
 # Live PID
 PID_WINDOW_S = float(_get_val("analysis.live_pid.window_s", 3.0))
@@ -194,8 +186,8 @@ PID_ALERT_COOLDOWN_S = float(_get_val("analysis.live_pid.alert_cooldown_s", 15.0
 
 # Cascade
 CASCADE_ATTITUDE_MIN_AMP_DEG = float(_get_val("analysis.cascade.attitude_min_amp_deg", 5.0))
-CASCADE_VELOCITY_MIN_AMP = float(_get_val("analysis.cascade.velocity_min_amp", 0.5))
-CASCADE_POSITION_MIN_AMP = float(_get_val("analysis.cascade.position_min_amp", 1.0))
+CASCADE_VELOCITY_MIN_AMP = float(_get_val("analysis.cascade.velocity_min_amp", 0.2))
+CASCADE_POSITION_MIN_AMP = float(_get_val("analysis.cascade.position_min_amp", 0.3))
 
 # Domains
 DOMAINS_PWM_MIN = float(_get_val("analysis.domains.pwm_min", 1000.0))
@@ -225,3 +217,5 @@ CONN_WATCHDOG_PERIOD_S = float(_get_val("mavlink.connection.watchdog_period_s", 
 CONN_STALE_MAX_AGE_S = float(_get_val("mavlink.connection.stale_max_age_s", 3.0))
 CONN_PARAM_READ_ATTEMPTS = int(_get_val("mavlink.connection.param_read_attempts", 3))
 CONN_PARAM_RETRY_BASE_S = float(_get_val("mavlink.connection.param_retry_base_s", 0.25))
+
+# Parameter Advisor

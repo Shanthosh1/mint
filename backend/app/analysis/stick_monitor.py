@@ -84,7 +84,9 @@ class StickMonitor:
 
     # -- internals --------------------------------------------------------
     async def _run(self) -> None:
-        async for event in HUB.subscribe():
+        async for event in HUB.subscribe(channels=frozenset({
+            "manual_control"
+        })):
             if event.channel != "manual_control":
                 continue
             now = time.monotonic()

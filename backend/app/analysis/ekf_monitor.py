@@ -86,7 +86,9 @@ class EkfMonitor:
             self._stale_task.cancel()
 
     async def _run(self) -> None:
-        async for event in HUB.subscribe():
+        async for event in HUB.subscribe(channels=frozenset({
+            "vfr_hud", "ekf_status", "estimator_status"
+        })):
             if event.channel == "vfr_hud":
                 self._track_throttle(event.payload)
             elif event.channel == "ekf_status":

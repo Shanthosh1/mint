@@ -170,8 +170,14 @@ export default function LiveLoopChart({ loop = 'rate', axis = 'roll' }) {
       },
     };
     plot.current = new uPlot(opts, [[], [], []], el.current);
-    const ro = new ResizeObserver(() =>
-      plot.current?.setSize({ width: el.current.clientWidth, height: 220 }));
+    let lastWidth = el.current?.clientWidth || 0;
+    const ro = new ResizeObserver(() => {
+      const w = el.current?.clientWidth || 0;
+      if (w !== lastWidth && w > 0) {
+        lastWidth = w;
+        plot.current?.setSize({ width: w, height: 220 });
+      }
+    });
     ro.observe(el.current);
     return () => { ro.disconnect(); plot.current?.destroy(); };
   }, [loop, axis, zoomFactor, minZoomRangeS]);

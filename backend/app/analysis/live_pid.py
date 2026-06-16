@@ -111,8 +111,10 @@ def _quat_to_roll_pitch(q: list[float]) -> tuple[float, float]:
 
 def compute_coherence_in_band(t: np.ndarray, x: np.ndarray, y: np.ndarray) -> Optional[float]:
     """Compute mean coherence between x and y in the 0.5-3.0 Hz frequency band."""
-    if len(t) < 20 or (t[-1] - t[0]) <= 0:
+    if len(t) < 8 or (t[-1] - t[0]) <= 0:
         return None
+    if np.std(x) < 1e-8 or np.std(y) < 1e-8:
+        return 0.0
     
     # Estimate sampling frequency
     dt = np.diff(t)
@@ -129,8 +131,8 @@ def compute_coherence_in_band(t: np.ndarray, x: np.ndarray, y: np.ndarray) -> Op
         return None
     
     # Compute coherence
-    nperseg = min(len(x), max(64, len(x) // 4))
-    if nperseg < 8:
+    nperseg = min(len(x), max(8, len(x) // 4))
+    if nperseg < 4:
         return None
         
     try:
@@ -239,6 +241,9 @@ class LivePidEngine:
         self._window_s_override: dict[str, float] = defaultdict(lambda: _WINDOW_S)
         self._recommended_axes_this_cycle: set[str] = set()
         self._task: asyncio.Task | None = None
+        self._last_step_t: dict[str, float] = {}
+        self._step_history: dict[str, list[dict]] = {ax: [] for ax in _AXES}
+        self._last_airframe_class: Optional[str] = None
 
     def _rate_param(self, axis: str, term: str) -> Optional[str]:
         """Resolve the rate-loop parameter for the detected airframe class.
@@ -275,10 +280,14 @@ class LivePidEngine:
     def stop(self) -> None:
         if self._task:
             self._task.cancel()
+        self._actuation_history.clear()
 
     # ------------------------------------------------------------------ #
     async def _run(self) -> None:
-        async for event in HUB.subscribe():
+        async for event in HUB.subscribe(channels=frozenset({
+            "attitude_target", "extended_sys_state", "vfr_hud",
+            "attitude", "actuation", "airframe", "connection"
+        })):
             if event.channel == "attitude_target":
                 p = event.payload
                 for ax, (_, sp_field) in _AXES.items():
@@ -297,10 +306,27 @@ class LivePidEngine:
                 self._ingest(event.payload)
             elif event.channel == "actuation":
                 self._ingest_actuation(event.payload)
+            elif event.channel == "airframe":
+                new_class = event.payload.get("airframe_class")
+                if self._last_airframe_class is not None and self._last_airframe_class != new_class:
+                    for win in self._aspd_samples.values():
+                        win.clear()
+                    import logging
+                    logging.getLogger("mint").info(f"Airframe class changed from {self._last_airframe_class} to {new_class}. Cleared airspeed asymmetry samples.")
+                self._last_airframe_class = new_class
+            elif event.channel == "connection":
+                if not event.payload.get("connected", False):
+                    self._actuation_history.clear()
+                    for win in self._aspd_samples.values():
+                        win.clear()
 
     def _ingest_actuation(self, payload: dict) -> None:
         now = time.monotonic()
-        outputs = payload.get("motor_norms") or payload.get("surface_deflections") or []
+        outputs = payload.get("motor_norms")
+        if not outputs:
+            outputs = payload.get("surface_deflections")
+        if not outputs and "raw_channels" in payload:
+            outputs = [ch["norm"] for ch in payload["raw_channels"]]
         if outputs:
             self._actuation_history.append((now, [float(o) for o in outputs]))
             while self._actuation_history and self._actuation_history[0][0] < now - 10.0:
@@ -327,7 +353,6 @@ class LivePidEngine:
                 win.clear()
             self._offset_win["roll"].clear()
             self._offset_win["pitch"].clear()
-            self._actuation_history.clear()
             for ax in _AXES:
                 ADVISOR.clear_diagnostic_card(ax)
                 self._axis_active_start.pop(ax, None)
@@ -404,7 +429,10 @@ class LivePidEngine:
                         cooldown_s: float = 30.0,
                         confidence: Optional[str] = None,
                         limitations: Optional[str] = None,
-                        severity: Optional[str] = None) -> None:
+                        severity: Optional[str] = None,
+                        pre_step_motion: bool = False,
+                        ramped_input: bool = False,
+                        low_coherence: bool = False) -> None:
         if severity is None:
             severity = self._get_saturation_severity()
         if not self._is_proposal_allowed(param, scale_factor, delta, severity):
@@ -419,7 +447,10 @@ class LivePidEngine:
             cooldown_s=cooldown_s,
             is_saturation_gain_reduction=is_saturation_gain_reduction,
             confidence=confidence,
-            limitations=limitations
+            limitations=limitations,
+            pre_step_motion=pre_step_motion,
+            ramped_input=ramped_input,
+            low_coherence=low_coherence
         )
         self._recommended_axes_this_cycle.add(ax)
 
@@ -453,6 +484,7 @@ class LivePidEngine:
         metrics: dict[str, dict] = {}
         worst_r = None
         self._recommended_axes_this_cycle.clear()
+        self._rejected_axes_this_cycle = set()
 
         # Capture saturation metrics once per evaluation cycle
         act_sat_info = check_actuator_saturation(list(self._actuation_history))
@@ -485,10 +517,18 @@ class LivePidEngine:
                 t, sp, act,
                 min_amp=config.PID_MIN_AMP,
                 ax=ax,
-                recommended_axes=self._recommended_axes_this_cycle
+                recommended_axes=self._recommended_axes_this_cycle,
+                last_step_t=self._last_step_t.get(ax),
+                rejected_axes=self._rejected_axes_this_cycle
             )
             if step:
                 m.update(step)
+                self._last_step_t[ax] = step["t_start"]
+                self._step_history[ax].append(step)
+                if len(self._step_history[ax]) > 10:
+                    self._step_history[ax].pop(0)
+                ADVISOR.clear_diagnostic_card(ax)
+            m["step_history"] = list(self._step_history[ax])
             m["sp_deg_s"] = round(math.degrees(sp[-1]), 1)
             m["act_deg_s"] = round(math.degrees(act[-1]), 1)
             metrics[ax] = m
@@ -519,7 +559,7 @@ class LivePidEngine:
             else:
                 coherence_score = 1.0
 
-            confidence_value = excitation_score * step_score * coherence_score
+            confidence_value = min(excitation_score, step_score, coherence_score)
             if step is not None and "noise_ratio" in step:
                 confidence_value *= (1.0 - step["noise_ratio"])
             
@@ -530,11 +570,25 @@ class LivePidEngine:
             else:
                 confidence_label = "Low confidence (needs clearer data)"
 
+            # Confidence caps based on noise_ratio:
+            if step is not None and "noise_ratio" in step:
+                nr = step["noise_ratio"]
+                if nr > 0.25:
+                    confidence_label = "Low confidence (needs clearer data)"
+                elif 0.15 < nr <= 0.25:
+                    if confidence_label != "Low confidence (needs clearer data)":
+                        confidence_label = "Medium confidence (passive observation)"
+
             limitations_note = None
             if step is not None and step.get("ramped_adjusted"):
                 limitations_note = "Input was slightly ramped; τ estimate adjusted."
             if step is not None and step.get("noise_ratio") is not None:
                 limitations_note = "Elevated pre-step noise; confidence degraded."
+
+            # Compute quality flags
+            pre_step_motion = step is not None and step.get("noise_ratio") is not None
+            ramped_input = step is not None and step.get("ramped_adjusted", False)
+            low_coherence = coherence is not None and coherence < 0.6
 
             # Passive analysis gating:
             # When excitation is low (std(sp) < 0.12 rad/s) and coherence < 0.6,
@@ -544,7 +598,16 @@ class LivePidEngine:
                 if std_sp < 0.12 and (coherence is None or coherence < 0.6):
                     skip_recommendations = True
 
-            self._verdicts(ax, m, now, confidence_label, limitations_note, skip_recommendations, severity=severity, act_sat_info=act_sat_info)
+            self._verdicts(
+                ax, m, now, confidence_label,
+                limitations_note=limitations_note,
+                skip_recommendations=skip_recommendations,
+                severity=severity,
+                act_sat_info=act_sat_info,
+                pre_step_motion=pre_step_motion,
+                ramped_input=ramped_input,
+                low_coherence=low_coherence
+            )
 
         # Update diagnostic cards for active/inactive axes
         for ax in _AXES:
@@ -564,8 +627,9 @@ class LivePidEngine:
                 if ax not in self._axis_active_start:
                     self._axis_active_start[ax] = now
                 
-                # Active for >10s
-                if now - self._axis_active_start[ax] > 10.0:
+                if ax in self._rejected_axes_this_cycle:
+                    pass
+                elif now - self._axis_active_start[ax] > 5.0:
                     if ax not in self._recommended_axes_this_cycle:
                         text = self._determine_diagnostic(ax, now, severity=severity)
                         ADVISOR.set_diagnostic_card(ax, text)
@@ -592,13 +656,20 @@ class LivePidEngine:
             return out
         out["r"] = round(float(np.corrcoef(sp, act)[0, 1]), 3)
         rmse = float(np.sqrt(np.mean((sp - act) ** 2)))
-        out["nrmse"] = round(rmse / sp_range, 3)
+        if sp_range > 0.1:
+            out["nrmse"] = round(rmse / sp_range, 3)
+        else:
+            out["nrmse"] = None
         return out
 
     @staticmethod
     def _step_response(t: np.ndarray, sp: np.ndarray, act: np.ndarray,
                        min_amp: float = 0.15, ax: Optional[str] = None,
-                       recommended_axes: Optional[set[str]] = None) -> Optional[dict]:
+                       recommended_axes: Optional[set[str]] = None,
+                       last_step_t: Optional[float] = None,
+                       sp_stable_window_s: float = 0.15,
+                       osc_window_s: float = 2.0,
+                       rejected_axes: Optional[set[str]] = None) -> Optional[dict]:
         """
         Isolate the largest commanded step and measure tau (63.2% rise),
         settling (into the +/-20% band), overshoot, and residual
@@ -627,13 +698,32 @@ class LivePidEngine:
             i_start -= 1
             
         t_start = t[i_start]
-        pre_mask = (t >= t_start - 1.0) & (t < t_start)
-        post_mask = t >= t0
-        if pre_mask.sum() < 3 or len(sp[post_mask]) < 8:
+        pre_window = 0.3 if (last_step_t is not None and (t_start - last_step_t) < 3.0) else 1.0
+        pre_mask = (t >= t_start - pre_window) & (t < t_start)
+        
+        osc_mask = (t >= t0) & (t <= t0 + osc_window_s)
+        
+        t_post_vals = t[t >= t0]
+        sp_post_vals = sp[t >= t0]
+        
+        if pre_mask.sum() < 3 or len(sp[osc_mask]) < 8:
             return None
 
         sp_pre = float(np.mean(sp[pre_mask]))
-        sp_post = float(np.mean(sp[post_mask][3:]))
+        
+        # Use only the stable early portion (skip transition, average settled region)
+        stable_start_t = t0 + 0.1   # skip first 0.1s transition clearing
+        stable_end_t = stable_start_t + sp_stable_window_s
+        stable_idx = (t_post_vals >= stable_start_t) & (t_post_vals < stable_end_t)
+        if len(t_post_vals) > 0:
+            if stable_idx.sum() >= 5:
+                sp_post = float(np.mean(sp_post_vals[stable_idx]))
+            else:
+                sp_post = float(np.mean(sp_post_vals[max(0, len(sp_post_vals)//2):]))
+        else:
+            sp_post = sp_pre
+
+        post_sp_std = float(np.std(sp_post_vals)) if len(sp_post_vals) > 0 else 0.0
         amp = sp_post - sp_pre
 
         # Size-agnostic significance gate: the step must dwarf the
@@ -642,24 +732,31 @@ class LivePidEngine:
 
         noise_ratio = None
 
+        _MIN_AMP = {"roll": 0.15, "pitch": 0.15, "yaw": 0.08}
+        if ax in _MIN_AMP:
+            min_amp = _MIN_AMP[ax]
+
         # Check rejection reasons:
         # Case 1: Genuine vibration
-        if act_noise > 0.05 and not VIB_GATE.ok():
+        if not VIB_GATE.ok():
             if ax and recommended_axes is not None:
                 ADVISOR.set_diagnostic_card(ax, "Step rejected: excessive vibration – fix mechanical issues first")
                 recommended_axes.add(ax)
+            if ax and rejected_axes is not None:
+                rejected_axes.add(ax)
             return None
 
         # Case 2: Pre-step motion
-        if act_noise > 0.05 and VIB_GATE.ok():
-            if abs(amp) < 2.0 * act_noise:
-                if ax and recommended_axes is not None:
-                    ADVISOR.set_diagnostic_card(ax, "Step rejected: vehicle was moving significantly in the 1 second before your input. Hold steady for 1.5 seconds, then step sharply.")
-                    recommended_axes.add(ax)
-                return None
-            # else: amplitude clears the noise floor — continue analysis,
-            # set degraded confidence flag downstream
-            noise_ratio = act_noise / abs(amp)
+        if abs(amp) < 1.5 * act_noise:
+            if ax and recommended_axes is not None:
+                ADVISOR.set_diagnostic_card(ax, "Step rejected: vehicle was moving significantly in the 1 second before your input. Hold steady for 1.5 seconds, then step sharply.")
+                recommended_axes.add(ax)
+            if ax and rejected_axes is not None:
+                rejected_axes.add(ax)
+            return None
+        # else: amplitude clears the noise floor — continue analysis,
+        # set degraded confidence flag downstream
+        noise_ratio = act_noise / abs(amp)
 
         # Calculate adaptive multiplier
         multiplier = 2.0 + 2.0 * min(abs(amp) / 0.3, 1.0)
@@ -669,13 +766,14 @@ class LivePidEngine:
             if ax and recommended_axes is not None:
                 ADVISOR.set_diagnostic_card(ax, f"Step rejected: input too small or too slow. Apply a larger, sharper stick deflection (≥{min_amp:.2f} rad/s).")
                 recommended_axes.add(ax)
+            if ax and rejected_axes is not None:
+                rejected_axes.add(ax)
             return None
 
-        post_sp_std = float(np.std(sp[post_mask][3:]))
-        if post_sp_std > 0.5 * abs(amp):
+        if post_sp_std > 0.7 * abs(amp):
             return None   # ramp / continuous stirring, not even a relaxed step
 
-        ta, aa = t[post_mask], act[post_mask]
+        ta, aa = t[osc_mask], act[osc_mask]
         sign = 1.0 if amp > 0 else -1.0
 
         # Check that we started below the 63.2% threshold relative to the step direction
@@ -710,7 +808,7 @@ class LivePidEngine:
         # rings ("oscillates twice") rather than just overshooting once.
         resid = aa - sp_post
         crossing_noise = min(act_noise, 0.03) if (act_noise > 0.05 and VIB_GATE.ok()) else act_noise
-        sig = resid[np.abs(resid) > max(0.03 * abs(amp), 2 * crossing_noise, 0.01)]
+        sig = resid[np.abs(resid) > max(0.03 * abs(amp), 2 * crossing_noise, 0.02)]
         crossings = int(np.count_nonzero(np.diff(np.sign(sig)) != 0)) if sig.size > 1 else 0
 
         post_duration = float(ta[-1] - t0) if len(ta) > 0 else 0.0
@@ -723,12 +821,13 @@ class LivePidEngine:
             "amplitude": amp,
             "post_sp_std": post_sp_std,
             "ramped_adjusted": ramped_adjusted,
+            "t_start": float(t_start),
         }
         if noise_ratio is not None:
             res_dict["noise_ratio"] = noise_ratio
         return res_dict
 
-    async def _advise_damping(self, ax: str, overshoot: float, osc: int, zeta: Optional[float], confidence_label: str, limitations_note: Optional[str], severity: Optional[str] = None) -> None:
+    async def _advise_damping(self, ax: str, overshoot: float, osc: Optional[int], zeta: Optional[float], confidence_label: str, limitations_note: Optional[str], severity: Optional[str] = None, pre_step_motion: bool = False, ramped_input: bool = False, low_coherence: bool = False) -> None:
         p_d = self._rate_param(ax, "D")
         p_p = self._rate_param(ax, "P")
         if not p_d or not p_p:
@@ -766,39 +865,47 @@ class LivePidEngine:
                 scale_factor=0.9,
                 confidence=confidence_label,
                 limitations=limitations_note,
-                severity=severity
+                severity=severity,
+                pre_step_motion=pre_step_motion,
+                ramped_input=ramped_input,
+                low_coherence=low_coherence
             )
         else:
             # Action: Increase D-gain
-            if osc >= 2:
+            if osc is not None and osc >= 2:
                 rationale = f"{ax.capitalize()} overshoot {overshoot*100:.0f}% with {osc} residual reversals — add derivative damping."
+            elif zeta is not None:
+                rationale = f"{ax.capitalize()} overshoot {overshoot*100:.0f}% with low damping ratio (ζ={zeta:.2f}) — add derivative damping."
             else:
-                zeta_val = zeta if zeta is not None else 0.0
-                rationale = f"{ax.capitalize()} overshoot {overshoot*100:.0f}% with low damping ratio (ζ={zeta_val:.2f}) — add derivative damping."
+                rationale = f"{ax.capitalize()} overshoot {overshoot*100:.0f}% and failed to settle — add derivative damping."
 
             self._safe_recommend(
                 ax, p_d, rationale,
                 scale_factor=1.15,
                 confidence=confidence_label,
                 limitations=limitations_note,
-                severity=severity
+                severity=severity,
+                pre_step_motion=pre_step_motion,
+                ramped_input=ramped_input,
+                low_coherence=low_coherence
             )
 
     # ------------------------------------------------------------------ #
-    def _verdicts(self, ax: str, m: dict, now: float, confidence_label: str, limitations_note: Optional[str] = None, skip_recommendations: bool = False, severity: Optional[str] = None, act_sat_info: Optional[tuple] = None) -> None:
+    def _verdicts(self, ax: str, m: dict, now: float, confidence_label: str, limitations_note: Optional[str] = None, skip_recommendations: bool = False, severity: Optional[str] = None, act_sat_info: Optional[tuple] = None, pre_step_motion: bool = False, ramped_input: bool = False, low_coherence: bool = False) -> None:
         """Turn one window's metrics into alerts + stageable advice."""
         if STICK_MONITOR._tuning_active and STICK_MONITOR._needed_loop != "rate":
             return
 
         # Check consecutive windows showing overshoot > 20% but zero oscillations
         overshoot = m.get("overshoot", 0.0)
-        osc = m.get("oscillations", 0)
+        measured_osc = m.get("oscillations")
 
-        if overshoot > 0.20 and osc == 0:
-            self._consecutive_overshoot_no_osc[ax] += 1
-        else:
-            self._consecutive_overshoot_no_osc[ax] = 0
-            self._window_s_override[ax] = _WINDOW_S
+        if measured_osc is not None:
+            if overshoot > 0.20 and measured_osc == 0:
+                self._consecutive_overshoot_no_osc[ax] += 1
+            else:
+                self._consecutive_overshoot_no_osc[ax] = 0
+                self._window_s_override[ax] = _WINDOW_S
             # Immediately prune the window to _WINDOW_S
             win = self._win[ax]
             horizon = now - _WINDOW_S
@@ -872,7 +979,10 @@ class LivePidEngine:
                         scale_factor=round(reduction, 3),
                         confidence=confidence_label,
                         limitations=limitations_note,
-                        severity=severity
+                        severity=severity,
+                        pre_step_motion=pre_step_motion,
+                        ramped_input=ramped_input,
+                        low_coherence=low_coherence
                     )
 
                 if config.EXPERT_MODE:
@@ -888,7 +998,10 @@ class LivePidEngine:
                                 is_saturation_gain_reduction=True,
                                 confidence=confidence_label,
                                 limitations=limitations_note,
-                                severity=severity
+                                severity=severity,
+                                pre_step_motion=pre_step_motion,
+                                ramped_input=ramped_input,
+                                low_coherence=low_coherence
                             )
             # Under saturation, block all other tuning proposals on this axis
             return
@@ -940,6 +1053,9 @@ class LivePidEngine:
         elif overshoot > 0.20 and zeta is not None and zeta < 0.3 and osc is not None and osc >= 1:
             is_underdamped = True
             branch = "B"
+        elif overshoot > _OVERSHOOT_LIMIT and settling is None and (m.get("oscillations") is None or osc >= 1 or tau is not None):
+            is_underdamped = True
+            branch = "C"
 
         if is_underdamped:
             self._last_alert[ax] = now
@@ -947,10 +1063,13 @@ class LivePidEngine:
             if branch == "A":
                 conf = "High – clear ringing observed"
                 alert_text = (f"{ax.capitalize()} overshoots {overshoot*100:.0f}% and "
-                              f"rings ({osc} reversals) before settling — damping deficit.")
-            else:
+                               f"rings ({osc} reversals) before settling — damping deficit.")
+            elif branch == "B":
                 conf = "Medium – extrapolated from zeta, no observed ringing"
                 alert_text = f"{ax.capitalize()} overshoots {overshoot*100:.0f}% with low damping ratio (ζ={zeta:.2f}) — damping deficit."
+            else:
+                conf = "Medium – fails to settle, potential oscillation"
+                alert_text = f"{ax.capitalize()} overshoots {overshoot*100:.0f}% and never settled — damping deficit."
 
             HUB.publish("alert", {
                 "severity": "warning", "source": "pid",
@@ -958,15 +1077,15 @@ class LivePidEngine:
             })
 
             try:
-                asyncio.create_task(self._advise_damping(ax, overshoot, osc, zeta, conf, limitations_note, severity))
+                asyncio.create_task(self._advise_damping(ax, overshoot, osc, zeta, conf, limitations_note, severity, pre_step_motion=pre_step_motion, ramped_input=ramped_input, low_coherence=low_coherence))
             except RuntimeError:
                 try:
-                    asyncio.run(self._advise_damping(ax, overshoot, osc, zeta, conf, limitations_note, severity))
+                    asyncio.run(self._advise_damping(ax, overshoot, osc, zeta, conf, limitations_note, severity, pre_step_motion=pre_step_motion, ramped_input=ramped_input, low_coherence=low_coherence))
                 except Exception:
                     pass
             return
 
-        if overshoot > _OVERSHOOT_LIMIT and osc is not None:
+        if overshoot > _OVERSHOOT_LIMIT and m.get("oscillations") is not None and m.get("oscillations") == 0:
             self._last_alert[ax] = now
             p_p = self._rate_param(ax, "P")
             HUB.publish("alert", {
@@ -981,7 +1100,10 @@ class LivePidEngine:
                     scale_factor=0.9,
                     confidence=confidence_label,
                     limitations=limitations_note,
-                    severity=severity
+                    severity=severity,
+                    pre_step_motion=pre_step_motion,
+                    ramped_input=ramped_input,
+                    low_coherence=low_coherence
                 )
             return
 
@@ -998,7 +1120,10 @@ class LivePidEngine:
                             scale_factor=1.1,
                             confidence=confidence_label,
                             limitations=limitations_note,
-                            severity=severity
+                            severity=severity,
+                            pre_step_motion=pre_step_motion,
+                            ramped_input=ramped_input,
+                            low_coherence=low_coherence
                         )
                     else:
                         HUB.publish("alert", {
@@ -1015,8 +1140,26 @@ class LivePidEngine:
                         scale_factor=0.85,
                         confidence=confidence_label,
                         limitations=limitations_note,
-                        severity=severity
+                        severity=severity,
+                        pre_step_motion=pre_step_motion,
+                        ramped_input=ramped_input,
+                        low_coherence=low_coherence
                     )
+                else:
+                    p_p = self._rate_param(ax, "P")
+                    if p_p:
+                        self._safe_recommend(
+                            ax, p_p,
+                            f"{ax.capitalize()} is sluggish under saturation — reduce P-gain to lower demand.",
+                            scale_factor=0.9,
+                            confidence=confidence_label,
+                            limitations=limitations_note,
+                            severity=severity,
+                            pre_step_motion=pre_step_motion,
+                            ramped_input=ramped_input,
+                            low_coherence=low_coherence
+                        )
+                        ADVISOR.set_diagnostic_card(ax, f"{ax.capitalize()} is sluggish under saturation. Proposing P-gain reduction.")
             return
 
         if tau is None and m.get("step_amp_deg_s"):
@@ -1037,39 +1180,50 @@ class LivePidEngine:
                             scale_factor=0.85,
                             confidence=confidence_label,
                             limitations=limitations_note,
-                            severity=severity
+                            severity=severity,
+                            pre_step_motion=pre_step_motion,
+                            ramped_input=ramped_input,
+                            low_coherence=low_coherence
                         )
                     else:
                         # Yaw has no RAUTO_MAX — fall through to P reduction below
                         p_p = self._rate_param(ax, "P")
-                        if p_p and VIB_GATE.ok():
+                        if p_p:
                             self._safe_recommend(
                                 ax, p_p,
                                 f"{ax.capitalize()} never reached command under saturation — reduce P-gain to lower demand.",
                                 scale_factor=0.9,
                                 confidence=confidence_label,
                                 limitations=limitations_note,
-                                severity=severity
+                                severity=severity,
+                                pre_step_motion=pre_step_motion,
+                                ramped_input=ramped_input,
+                                low_coherence=low_coherence
                             )
+                            ADVISOR.set_diagnostic_card(ax, f"{ax.capitalize()} is sluggish under saturation. Proposing P-gain reduction.")
                 else:
                     # No saturation — under-gained
-                    p_p = self._rate_param(ax, "P")
-                    if p_p:
-                        if VIB_GATE.ok():
-                            self._safe_recommend(
-                                ax, p_p,
-                                f"{ax.capitalize()} never reached 63.2% of command — likely under-gained. Raise P ~10%.",
-                                scale_factor=1.1,
-                                confidence=confidence_label,
-                                limitations=limitations_note,
-                                severity=severity
-                            )
-                        else:
-                            HUB.publish("alert", {
-                                "severity": "info", "source": "pid",
-                                "text": (f"{ax.capitalize()} appears under-gained but gain raises "
-                                         f"are suspended while vibration is high."),
-                            })
+                    if overshoot <= _OVERSHOOT_LIMIT:
+                        p_p = self._rate_param(ax, "P")
+                        if p_p:
+                            if VIB_GATE.ok():
+                                self._safe_recommend(
+                                    ax, p_p,
+                                    f"{ax.capitalize()} never reached 63.2% of command — likely under-gained. Raise P ~10%.",
+                                    scale_factor=1.1,
+                                    confidence=confidence_label,
+                                    limitations=limitations_note,
+                                    severity=severity,
+                                    pre_step_motion=pre_step_motion,
+                                    ramped_input=ramped_input,
+                                    low_coherence=low_coherence
+                                )
+                            else:
+                                HUB.publish("alert", {
+                                    "severity": "info", "source": "pid",
+                                    "text": (f"{ax.capitalize()} appears under-gained but gain raises "
+                                             f"are suspended while vibration is high."),
+                                })
 
     # ------------------------------------------------------------------ #
     # STEADY_HOLD: integrator-deficit (steady-state offset) detection
