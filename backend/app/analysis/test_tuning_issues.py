@@ -2374,6 +2374,197 @@ class TestNewPipelineImprovements(unittest.TestCase):
             mock_publish.assert_called_with("cascade_state", unittest.mock.ANY)
 
 
+class TestNewOfflineAnalysisModules(unittest.TestCase):
+    def test_velocity_offline(self):
+        from backend.app.analysis.velocity_offline import analyze_velocity
+        
+        # Test airframe gate
+        res = analyze_velocity(None, None, {}, "FIXED_WING")
+        self.assertIn("skipped", res)
+        
+        # Generate dummy data for velocity loop (15s at 100Hz)
+        t = np.arange(100.0, 115.0, 0.01)
+        
+        # Scenario 1: Overshoot (P-gain decrease)
+        sp = np.zeros_like(t)
+        sp[t >= 102.0] = 2.0
+        
+        act = np.zeros_like(t)
+        t_step = t[t >= 102.0] - 102.0
+        # High overshoot formula
+        act[t >= 102.0] = 2.0 * (1.0 - np.exp(-1.5 * t_step) * (np.cos(5.0 * t_step) - 0.8 * np.sin(5.0 * t_step)))
+        
+        local_pos_sp = pd.DataFrame({"timestamp": t * 1e6, "vx": sp, "vy": sp, "vz": sp})
+        local_pos = pd.DataFrame({"timestamp": t * 1e6, "vx": act, "vy": act, "vz": act})
+        
+        params = {
+            "MPC_XY_VEL_P_ACC": 1.0,
+            "MPC_XY_VEL_I_ACC": 0.1,
+            "MPC_XY_VEL_D_ACC": 0.01,
+            "MPC_Z_VEL_P_ACC": 1.0,
+            "MPC_Z_VEL_I_ACC": 0.1,
+            "MPC_Z_VEL_D_ACC": 0.01,
+        }
+        
+        res_os = analyze_velocity(local_pos, local_pos_sp, params, "MULTIROTOR")
+        self.assertIn("axes", res_os)
+        rec_p = [r for r in res_os["recommendations"] if r["param"] == "MPC_XY_VEL_P_ACC"]
+        self.assertTrue(len(rec_p) > 0)
+        self.assertTrue(rec_p[0]["proposed_value"] < 1.0)
+        
+        # Scenario 2: Sluggish settling (P-gain increase)
+        act_sluggish = np.zeros_like(t)
+        act_sluggish[t >= 102.0] = 2.0 * (0.65 * (1.0 - np.exp(-10.0 * t_step)) + 0.35 * (1.0 - np.exp(-0.4 * t_step)))
+        local_pos["vx"] = act_sluggish
+        local_pos["vy"] = act_sluggish
+        local_pos["vz"] = act_sluggish
+        res_sluggish = analyze_velocity(local_pos, local_pos_sp, params, "MULTIROTOR")
+        rec_p_inc = [r for r in res_sluggish["recommendations"] if r["param"] == "MPC_XY_VEL_P_ACC"]
+        self.assertTrue(len(rec_p_inc) > 0)
+        self.assertTrue(rec_p_inc[0]["proposed_value"] > 1.0)
+
+        # Scenario 3: Steady-state offset (I-gain increase)
+        # Create steady-state error (I-gain deficit)
+        # Offset is constant 0.1 m/s (>0.05) on settled part (std < 0.05)
+        act_offset = np.zeros_like(t)
+        act_offset[t >= 102.0] = 1.9 # constant offset of 0.1
+        local_pos["vx"] = act_offset
+        local_pos["vy"] = act_offset
+        local_pos["vz"] = act_offset
+        res_ss = analyze_velocity(local_pos, local_pos_sp, params, "MULTIROTOR")
+        rec_i = [r for r in res_ss["recommendations"] if r["param"] == "MPC_XY_VEL_I_ACC"]
+        self.assertTrue(len(rec_i) > 0)
+        self.assertTrue(rec_i[0]["proposed_value"] > 0.1)
+
+    def test_position_offline(self):
+        from backend.app.analysis.position_offline import analyze_position
+        
+        # Test airframe gate
+        res = analyze_position(None, None, {}, "FIXED_WING")
+        self.assertIn("skipped", res)
+        
+        # Generate dummy data for position loop (15s at 100Hz)
+        t = np.arange(100.0, 115.0, 0.01)
+        sp = np.zeros_like(t)
+        sp[t >= 102.0] = 5.0
+        
+        act = np.zeros_like(t)
+        t_step = t[t >= 102.0] - 102.0
+        # High overshoot
+        act[t >= 102.0] = 5.0 * (1.0 - np.exp(-1.5 * t_step) * (np.cos(5.0 * t_step) - 0.8 * np.sin(5.0 * t_step)))
+        
+        local_pos_sp = pd.DataFrame({"timestamp": t * 1e6, "x": sp, "y": sp, "z": sp})
+        local_pos = pd.DataFrame({"timestamp": t * 1e6, "x": act, "y": act, "z": act})
+        
+        params = {
+            "MPC_XY_P": 1.0,
+            "MPC_Z_P": 1.0,
+        }
+        
+        res_os = analyze_position(local_pos, local_pos_sp, params, "MULTIROTOR")
+        self.assertIn("axes", res_os)
+        rec = [r for r in res_os["recommendations"] if r["param"] == "MPC_XY_P"]
+        self.assertTrue(len(rec) > 0)
+        self.assertTrue(rec[0]["proposed_value"] < 1.0)
+
+    def test_tecs_offline(self):
+        from backend.app.analysis.tecs_offline import analyze_tecs
+        
+        # Test airframe gate
+        res = analyze_tecs(None, None, None, None, None, {}, "MULTIROTOR")
+        self.assertIn("skipped", res)
+        
+        # Build 60-second flight log at 10 Hz
+        t = np.arange(100.0, 160.0, 0.1)
+        
+        # Level flight segment from 105s to 120s (15s)
+        # climb_rate = -vz. So vz should be < 0.5 in absolute value. Let's make it 0.1 (climb rate = -0.1)
+        vz = np.ones_like(t) * 2.0
+        vz[(t >= 105.0) & (t <= 120.0)] = -0.1  # climb rate = 0.1 m/s
+        
+        # Climb segment from 125s to 135s (10s)
+        # climb rate > 1.0 (vz < -1.0)
+        vz[(t >= 125.0) & (t <= 135.0)] = -3.0 # climb rate = 3.0 m/s
+        
+        # Descent segment from 140s to 150s (10s)
+        # climb rate < -1.0 (vz > 1.0)
+        vz[(t >= 140.0) & (t <= 150.0)] = 2.0 # climb rate = -2.0 m/s
+        
+        local_pos = pd.DataFrame({"timestamp": t * 1e6, "vz": vz})
+        
+        # Throttle (control[3])
+        # Level flight: stable throttle (std < 0.05). Let's make it 0.5.
+        # Climb: throttle > 0.8. Let's make it 0.9.
+        # Descent: throttle < 0.2. Let's make it 0.1.
+        ctrl3 = np.ones_like(t) * 0.4
+        ctrl3[(t >= 105.0) & (t <= 120.0)] = 0.5
+        ctrl3[(t >= 125.0) & (t <= 135.0)] = 0.9
+        ctrl3[(t >= 140.0) & (t <= 150.0)] = 0.1
+        controls = pd.DataFrame({"timestamp": t * 1e6, "control[3]": ctrl3})
+        
+        # Pitch
+        # Let's make pitch 3.0 degrees in level flight
+        pitch = np.ones_like(t) * np.radians(1.0)
+        pitch[(t >= 105.0) & (t <= 120.0)] = np.radians(3.0)
+        vehicle_att = pd.DataFrame({
+            "timestamp": t * 1e6,
+            "roll": np.zeros_like(t),
+            "pitch": pitch,
+            "yaw": np.zeros_like(t)
+        })
+        
+        # Airspeed
+        # cruise airspeed in level flight = 15.0 m/s
+        as_vals = np.ones_like(t) * 10.0
+        as_vals[(t >= 105.0) & (t <= 120.0)] = 15.0
+        airspeed = pd.DataFrame({"timestamp": t * 1e6, "indicated_airspeed_m_s": as_vals})
+        
+        params = {
+            "FW_THR_TRIM": 0.4,
+            "FW_PSP_OFF": 0.0,
+            "FW_AIRSPD_TRIM": 12.0,
+            "FW_CLIMB_MAX": 2.0,
+            "FW_SINK_MIN": 1.0,
+        }
+        
+        res = analyze_tecs(local_pos, controls, vehicle_att, airspeed, None, params, "FIXED_WING")
+        self.assertIn("stats", res)
+        recs = {r["param"]: r for r in res["recommendations"]}
+        
+        # Assert calibration values are generated correctly
+        self.assertIn("FW_THR_TRIM", recs)
+        self.assertEqual(recs["FW_THR_TRIM"]["proposed_value"], 0.5)
+        
+        self.assertIn("FW_PSP_OFF", recs)
+        self.assertEqual(recs["FW_PSP_OFF"]["proposed_value"], 3.0)
+        
+        self.assertIn("FW_AIRSPD_TRIM", recs)
+        self.assertEqual(recs["FW_AIRSPD_TRIM"]["proposed_value"], 15.0)
+        
+        self.assertIn("FW_CLIMB_MAX", recs)
+        self.assertEqual(recs["FW_CLIMB_MAX"]["proposed_value"], 3.0)
+        
+        self.assertIn("FW_SINK_MIN", recs)
+        self.assertEqual(recs["FW_SINK_MIN"]["proposed_value"], 2.0)
+
+    def test_npfg_offline(self):
+        from backend.app.analysis.npfg_offline import analyze_npfg
+        
+        # Test airframe gate
+        res = analyze_npfg({}, "MULTIROTOR")
+        self.assertIn("skipped", res)
+        
+        # NPFG auto tuning disabled
+        res_disabled = analyze_npfg({"NPFG_EN_AUTO_TUNING": 0.0}, "FIXED_WING")
+        self.assertEqual(len(res_disabled["recommendations"]), 1)
+        self.assertEqual(res_disabled["recommendations"][0]["param"], "NPFG_EN_AUTO_TUNING")
+        self.assertEqual(res_disabled["recommendations"][0]["proposed_value"], 1)
+        
+        # NPFG auto tuning enabled
+        res_enabled = analyze_npfg({"NPFG_EN_AUTO_TUNING": 1.0}, "FIXED_WING")
+        self.assertEqual(len(res_enabled["recommendations"]), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
 

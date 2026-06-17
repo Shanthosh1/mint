@@ -64,7 +64,12 @@
     "EKF2_BARO_DELAY":  { "max_step": 20.0, "abs_min": 0.0, "abs_max": 250.0 },
     "EKF2_MAG_NOISE":   { "max_step": 0.02, "abs_min": 0.001, "abs_max": 1.0 },
     "EKF2_ACC_NOISE":   { "max_step": 0.1,  "abs_min": 0.01, "abs_max": 1.0 },
-    "EKF2_GYR_NOISE":   { "max_step": 0.005, "abs_min": 0.0001, "abs_max": 0.1 }
+    "EKF2_GYR_NOISE":   { "max_step": 0.005, "abs_min": 0.0001, "abs_max": 0.1 },
+    "FW_THR_TRIM":      { "max_step": 0.1, "abs_min": 0.1, "abs_max": 0.95 },
+    "FW_PSP_OFF":       { "max_step": 2.0, "abs_min": -10.0, "abs_max": 10.0 },
+    "FW_CLIMB_MAX":     { "max_step": 2.0, "abs_min": 1.0, "abs_max": 15.0 },
+    "FW_SINK_MIN":      { "max_step": 1.0, "abs_min": 0.5, "abs_max": 5.0 },
+    "NPFG_EN_AUTO_TUNING": { "max_step": 1, "abs_min": 0, "abs_max": 1, "type": "int" }
   },
   "DELTA_WING": {
     "FW_RR_FF": { "max_step": 0.05, "abs_min": 0.0,   "abs_max": 2.0 },
@@ -81,7 +86,12 @@
     "IMU_GYRO_NF_FREQ": { "max_step": 30.0, "abs_min": 0.0, "abs_max": 419.0 },
     "EKF2_GPS_DELAY":   { "max_step": 50.0, "abs_min": 0.0, "abs_max": 300.0 },
     "EKF2_BARO_DELAY":  { "max_step": 20.0, "abs_min": 0.0, "abs_max": 250.0 },
-    "EKF2_MAG_NOISE":   { "max_step": 0.02, "abs_min": 0.001, "abs_max": 1.0 }
+    "EKF2_MAG_NOISE":   { "max_step": 0.02, "abs_min": 0.001, "abs_max": 1.0 },
+    "FW_THR_TRIM":      { "max_step": 0.1, "abs_min": 0.1, "abs_max": 0.95 },
+    "FW_PSP_OFF":       { "max_step": 2.0, "abs_min": -10.0, "abs_max": 10.0 },
+    "FW_CLIMB_MAX":     { "max_step": 2.0, "abs_min": 1.0, "abs_max": 15.0 },
+    "FW_SINK_MIN":      { "max_step": 1.0, "abs_min": 0.5, "abs_max": 5.0 },
+    "NPFG_EN_AUTO_TUNING": { "max_step": 1, "abs_min": 0, "abs_max": 1, "type": "int" }
   },
   "VTOL": {
     "MC_ROLLRATE_P":  { "max_step": 0.02, "abs_min": 0.05, "abs_max": 0.4 },
@@ -123,6 +133,11 @@
     "EKF2_ACC_NOISE":   { "max_step": 0.1,  "abs_min": 0.01, "abs_max": 1.0 },
     "MC_ROLLRAUTO_MAX":  { "max_step": 30.0, "abs_min": 10.0, "abs_max": 200.0 },
     "MC_PITCHRAUTO_MAX": { "max_step": 30.0, "abs_min": 10.0, "abs_max": 200.0 },
-    "MC_YAWRAUTO_MAX":   { "max_step": 30.0, "abs_min": 10.0, "abs_max": 200.0 }
+    "MC_YAWRAUTO_MAX":   { "max_step": 30.0, "abs_min": 10.0, "abs_max": 200.0 },
+    "FW_THR_TRIM":      { "max_step": 0.1, "abs_min": 0.1, "abs_max": 0.95 },
+    "FW_PSP_OFF":       { "max_step": 2.0, "abs_min": -10.0, "abs_max": 10.0 },
+    "FW_CLIMB_MAX":     { "max_step": 2.0, "abs_min": 1.0, "abs_max": 15.0 },
+    "FW_SINK_MIN":      { "max_step": 1.0, "abs_min": 0.5, "abs_max": 5.0 },
+    "NPFG_EN_AUTO_TUNING": { "max_step": 1, "abs_min": 0, "abs_max": 1, "type": "int" }
   }
 }

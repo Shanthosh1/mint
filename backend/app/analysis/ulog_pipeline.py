@@ -24,7 +24,8 @@ import re
 from ..core import config
 from ..mavlink.airframe import UnsupportedAirframeError, classify_airframe
 from . import (actuator_saturation, ekf_offline, filter_advisor,
-               pid_offline, vibration_fft)
+               pid_offline, vibration_fft, velocity_offline,
+               position_offline, tecs_offline, npfg_offline)
 
 log = logging.getLogger("mint.ulog")
 
@@ -96,6 +97,7 @@ _DATASETS = [
     "vtol_vehicle_status",
     "airspeed",
     "airspeed_validated",
+    "vehicle_local_position_setpoint",
 ]
 
 
@@ -472,6 +474,42 @@ def analyze(path: Path) -> dict:
     sections["ekf_noise"] = (
         ekf_offline.analyze_hover_noise(sensor, local_pos, report["initial_params"])
         if sensor is not None else {"skipped": "sensor_combined not logged"}
+    )
+
+    # Velocity loop analysis
+    sections["velocity"] = velocity_offline.analyze_velocity(
+        local_pos=local_pos,
+        local_pos_sp=dataset_frame(ulog, "vehicle_local_position_setpoint"),
+        params=report["initial_params"],
+        airframe_class=report["airframe_class"],
+        status=status,
+    )
+
+    # Position loop analysis
+    sections["position"] = position_offline.analyze_position(
+        local_pos=local_pos,
+        local_pos_sp=dataset_frame(ulog, "vehicle_local_position_setpoint"),
+        params=report["initial_params"],
+        airframe_class=report["airframe_class"],
+        status=status,
+    )
+
+    # TECS analysis
+    sections["tecs"] = tecs_offline.analyze_tecs(
+        local_pos=local_pos,
+        controls=dataset_frame(ulog, "actuator_controls_0"),
+        vehicle_att=vehicle_att,
+        airspeed=dataset_frame(ulog, "airspeed"),
+        airspeed_validated=dataset_frame(ulog, "airspeed_validated"),
+        params=report["initial_params"],
+        airframe_class=report["airframe_class"],
+        status=status,
+    )
+
+    # NPFG analysis
+    sections["npfg"] = npfg_offline.analyze_npfg(
+        params=report["initial_params"],
+        airframe_class=report["airframe_class"],
     )
 
     return report
