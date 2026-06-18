@@ -742,6 +742,9 @@ class TestNewTuningImprovements(unittest.IsolatedAsyncioTestCase):
             "OUT4_MIN": 1000.0,
             "OUT4_MAX": 2000.0,
             "OUT4_TRIM": 1500.0,
+            # Control surface types
+            "CA_SV_CS0_TYPE": 1.0,  # Left Aileron
+            "CA_SV_CS1_TYPE": 3.0,  # Elevator
         }
         
         async def mock_read_param(name, attempts=None):
@@ -767,6 +770,10 @@ class TestNewTuningImprovements(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(conn.state.actuator_limits[2]["min"], 1100.0)
             self.assertEqual(conn.state.actuator_limits[2]["max"], 1900.0)
             self.assertEqual(conn.state.actuator_limits[2]["trim"], 1550.0)
+            
+            # Verify discovered actuator names
+            self.assertEqual(conn.state.actuator_names[2], "Left Aileron")
+            self.assertEqual(conn.state.actuator_names[3], "Elevator")
 
     def test_vibration_gate_hysteresis(self):
         from backend.app.analysis.vibration_live import VIB_GATE
@@ -2311,7 +2318,7 @@ class TestNewPipelineImprovements(unittest.TestCase):
             mock_conn.state.actuator_limits = {}
             
             # Send actuator status values
-            monitor._process_actuator_status({"actuator": [0.5, -0.5, 0.0]})
+            monitor._process_actuator_status({"actuator": [1900.0, 1450.0, 1000.0]})
             
             # Verify that hub publish was called
             mock_hub.publish.assert_called_with("actuation", unittest.mock.ANY)
@@ -2319,10 +2326,10 @@ class TestNewPipelineImprovements(unittest.TestCase):
             self.assertTrue(payload.get("unmapped"))
             self.assertIn("motor_norms", payload)
             # Since unmapped, all active channels are treated as motors for saturation check
-            self.assertEqual(len(payload["motor_norms"]), 2)
-            # Check guessed deflections for the negative value
+            self.assertEqual(len(payload["motor_norms"]), 3)
+            # Check guessed deflections
             self.assertIn("surface_deflections", payload)
-            self.assertEqual(len(payload["surface_deflections"]), 1) # only channel 2 was negative
+            self.assertEqual(len(payload["surface_deflections"]), 1)
 
     def test_vibration_gate_reconnect_reset(self):
         # Verify vibration gate resets self._last_ok_val and self._last_cleared_time on reconnect
@@ -2347,6 +2354,81 @@ class TestNewPipelineImprovements(unittest.TestCase):
             
         self.assertTrue(gate._last_ok_val)
         self.assertEqual(gate._last_cleared_time, 0.0)
+
+    def test_actuator_status_dynamic_range_detection(self):
+        # Verify ActuationMonitor correctly detects raw vs normalized status values
+        from backend.app.analysis.domains import ActuationMonitor
+        monitor = ActuationMonitor()
+        
+        with patch("backend.app.analysis.domains.CONNECTION") as mock_conn, \
+             patch("backend.app.analysis.domains.HUB") as mock_hub:
+            mock_conn.state.actuator_map = {"hover_motors": [0, 1]}
+            mock_conn.state.actuator_limits = {}
+            
+            # Scenario A: Normalized values [-1.0, 1.0] (e.g. 0.5 hover)
+            # Hover is 0.5, which should map to (0.5+1.0)/2.0 = 75% -> 1750 us raw
+            monitor._process_actuator_status({"actuator": [0.5, 0.5, 0.0, 0.0]})
+            mock_hub.publish.assert_called_with("actuation", unittest.mock.ANY)
+            payload = mock_hub.publish.call_args[0][1]
+            self.assertEqual(payload["motor_norms"], [0.75, 0.75])
+            
+            # Scenario B: Raw microsecond values (e.g. 1500 hover)
+            # Hover is 1500, which maps directly to (1500-1000)/1000 = 50% -> 1500 us raw
+            monitor._process_actuator_status({"actuator": [1500.0, 1500.0, 1000.0, 1000.0]})
+            payload = mock_hub.publish.call_args[0][1]
+            self.assertEqual(payload["motor_norms"], [0.5, 0.5])
+
+    def test_actuator_status_all_active_channels_admitted(self):
+        # Verify that all active channels (both mapped and unmapped, even at trim) are admitted to raw_channels
+        from backend.app.analysis.domains import ActuationMonitor
+        monitor = ActuationMonitor()
+        
+        with patch("backend.app.analysis.domains.CONNECTION") as mock_conn, \
+             patch("backend.app.analysis.domains.HUB") as mock_hub:
+            mock_conn.state.actuator_map = {
+                "hover_motors": [0, 1],
+                "control_surfaces": [2]
+            }
+            mock_conn.state.actuator_limits = {
+                3: {"min": 1000.0, "max": 2000.0, "trim": 1500.0, "range": 500.0}
+            }
+            
+            # Scenario A: Raw values (is_raw = True)
+            # - Ch0 (mapped motor) = 1200
+            # - Ch1 (mapped motor) = 1300
+            # - Ch2 (mapped surface) = 1500
+            # - Ch3 (unmapped) = 1500 (at trim)
+            # - Ch4 (unmapped) = 1700 (away from default trim)
+            # - Ch5 (unmapped/inactive) = 0.0 (inactive raw value -> should be excluded!)
+            monitor._process_actuator_status({"actuator": [1200.0, 1300.0, 1500.0, 1500.0, 1700.0, 0.0]})
+            mock_hub.publish.assert_called_with("actuation", unittest.mock.ANY)
+            payload = mock_hub.publish.call_args[0][1]
+            
+            admitted_channels = [ch["ch"] for ch in payload["raw_channels"]]
+            self.assertIn(1, admitted_channels)
+            self.assertIn(2, admitted_channels)
+            self.assertIn(3, admitted_channels)
+            self.assertIn(4, admitted_channels)
+            self.assertIn(5, admitted_channels)
+            self.assertNotIn(6, admitted_channels)
+            
+            # Scenario B: Normalized values (is_raw = False)
+            # - Ch0 (mapped motor) = 0.5
+            # - Ch1 (mapped motor) = -0.5
+            # - Ch2 (mapped surface) = 0.0
+            # - Ch3 (unmapped) = 0.0 (idle/at trim -> should be excluded!)
+            # - Ch4 (unmapped) = 0.1 (active -> should be admitted!)
+            # - Ch5 (unmapped/inactive) = float('nan') (inactive -> should be excluded!)
+            import math
+            monitor._process_actuator_status({"actuator": [0.5, -0.5, 0.0, 0.0, 0.1, float('nan')]})
+            payload = mock_hub.publish.call_args[0][1]
+            admitted_norm = [ch["ch"] for ch in payload["raw_channels"]]
+            self.assertIn(1, admitted_norm)
+            self.assertIn(2, admitted_norm)
+            self.assertIn(3, admitted_norm)
+            self.assertNotIn(4, admitted_norm)
+            self.assertIn(5, admitted_norm)
+            self.assertNotIn(6, admitted_norm)
 
     def test_cascade_state_recalculation_on_vtol_mode(self):
         # Verify CascadeState recalculates domain immediately on vtol_state change

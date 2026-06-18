@@ -1,25 +1,10 @@
-import { useState } from 'react';
-import { useChannelState, useTelemetryChannel } from '../hooks/useTelemetry.js';
+import { useChannelState } from '../hooks/useTelemetry.js';
 
 const AXES = ['x', 'y', 'z'];
 const GAUGE_MAX = 75.0; // warning = 30, critical = 60
 
 export default function VibrationPanel() {
   const vib = useChannelState('vibration_metrics');
-  const [alerts, setAlerts] = useState([]);
-
-  useTelemetryChannel('alert', (d) => {
-    if (!d) {
-      setAlerts([]);
-      return;
-    }
-    if (d.source !== 'vibration') return;
-    setAlerts((prev) => {
-      // Prevent duplicates by text match
-      const filtered = prev.filter((a) => a.text !== d.text);
-      return [{ ...d, id: Date.now() + Math.random() }, ...filtered];
-    });
-  });
 
   const unknown = !vib;
   const xVal = vib?.x ?? 0;
@@ -52,50 +37,12 @@ export default function VibrationPanel() {
             {statusLabel}
           </span>
         </h2>
-        {alerts.length > 0 && (
-          <button
-            className="btn"
-            style={{ padding: '4px 8px', fontSize: '0.72rem', borderRadius: '6px' }}
-            onClick={() => setAlerts([])}
-          >
-            Clear alerts
-          </button>
-        )}
       </div>
 
       {unknown && <div className="muted">Waiting for vibration telemetry stream…</div>}
 
       {!unknown && (
         <>
-          {alerts.length > 0 && (
-            <div className="stack" style={{ marginBottom: '14px' }}>
-              {alerts.slice(0, 2).map((a) => (
-                <div
-                  key={a.id}
-                  className={`alert ${a.severity || 'info'}`}
-                  style={{ display: 'flex', gap: '8px', padding: '8px 12px', fontSize: '0.8rem', alignItems: 'center' }}
-                >
-                  <div style={{ flexGrow: 1 }}>{a.text}</div>
-                  <button
-                    className="btn"
-                    style={{
-                      padding: '2px 6px',
-                      fontSize: '0.7rem',
-                      borderRadius: '4px',
-                      background: 'rgba(255,255,255,0.08)',
-                      border: '1px solid var(--glass-border)',
-                      color: 'var(--text-hi)',
-                      cursor: 'pointer',
-                    }}
-                    onClick={() => setAlerts((prev) => prev.filter((x) => x.id !== a.id))}
-                  >
-                    ✕
-                  </button>
-                </div>
-              ))}
-            </div>
-          )}
-
           {AXES.map((axis, idx) => {
             const val = vib[axis] ?? 0;
             const cls = val >= 60.0 ? 'crit' : val >= 30.0 ? 'warn' : 'ok';

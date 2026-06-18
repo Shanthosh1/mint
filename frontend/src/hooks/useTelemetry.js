@@ -51,6 +51,22 @@ export function useFrontendConfig() {
   return config;
 }
 
+let isVehicleConnected = false;
+let lastTelemetryTime = Date.now();
+let hasLoggedDataGap = false;
+let watchdogInterval = null;
+
+if (typeof window !== 'undefined' && !watchdogInterval) {
+  watchdogInterval = setInterval(() => {
+    if (isVehicleConnected && (Date.now() - lastTelemetryTime > 2000)) {
+      if (!hasLoggedDataGap) {
+        console.warn("[MINT Debug] Vehicle is connected, but no telemetry data has been received for >2 seconds.");
+        hasLoggedDataGap = true;
+      }
+    }
+  }, 1000);
+}
+
 function ensureSocket(setConnected) {
   if (socket && socket.readyState <= WebSocket.OPEN) return;
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -58,10 +74,30 @@ function ensureSocket(setConnected) {
 
   socket.onopen = () => setConnected?.(true);
   socket.onmessage = (e) => {
-    const { ch, t, ts, d } = JSON.parse(e.data);
-    // t = server monotonic (ordering only); ts = wall-clock epoch seconds.
+    let parsed;
+    try {
+      parsed = JSON.parse(e.data);
+    } catch (err) {
+      console.error("Failed to parse WebSocket message:", err);
+      return;
+    }
+    const { ch, t, ts, d } = parsed;
+
     listeners.get(ch)?.forEach((fn) => fn(d, t, ch, ts));
     listeners.get('*')?.forEach((fn) => fn(d, t, ch, ts));
+
+    if (ch === 'connection') {
+      isVehicleConnected = !!(d && d.connected);
+      if (!isVehicleConnected) {
+        hasLoggedDataGap = false;
+      }
+    } else {
+      lastTelemetryTime = Date.now();
+      if (hasLoggedDataGap) {
+        console.log("[MINT Debug] Telemetry data stream resumed.");
+        hasLoggedDataGap = false;
+      }
+    }
 
     if (ch === 'connection' && d?.connected === false) {
       listeners.forEach((set, channel) => {

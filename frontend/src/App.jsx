@@ -8,6 +8,7 @@ import ActuatorPanel from './components/ActuatorPanel.jsx';
 import AlertStack from './components/AlertStack.jsx';
 import ProposalsPanel from './components/ProposalsPanel.jsx';
 import UlogPanel from './components/UlogPanel.jsx';
+import WarningConsole from './components/WarningConsole.jsx';
 
 const REGIME_LABELS = {
   pre_flight: { label: 'Pre-Flight', dot: 'off' },
@@ -72,12 +73,10 @@ export default function App() {
         <div style={{ flex: 1 }} className="topbar-spacer" />
 
         <div className="topbar-status">
-          {mode && (
-            <span className="badge" title={`custom_mode ${mode.custom_mode}`}>
-              <span className={`dot ${mode.armed ? 'warn' : 'off'}`} />
-              {mode.mode}{mode.armed ? ' · ARMED' : ''}
-            </span>
-          )}
+          <span className="badge" title={mode ? `custom_mode ${mode.custom_mode}` : 'Waiting for heartbeat...'}>
+            <span className={`dot ${mode?.armed ? 'warn' : 'off'}`} />
+            {mode ? `${mode.mode}${mode.armed ? ' · ARMED' : ''}` : 'no mode'}
+          </span>
           <span className="badge" title={`stick σ²: ${regime?.stick_variance ?? '—'}`}>
             <span className={`dot ${r.dot}`} />
             {r.label}
@@ -97,6 +96,7 @@ export default function App() {
         <div className="grid animate-fade">
           <div className="col">
             <ActuatorPanel />
+            <WarningConsole />
           </div>
           <div className="col col-main">
             <PidPanel />

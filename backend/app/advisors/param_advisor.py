@@ -72,6 +72,9 @@ class ParamAdvisor:
     def stop(self) -> None:
         pass
 
+    def _publish_proposals(self) -> None:
+        HUB.publish("proposal", {"proposals": self.list_proposals()})
+
     def set_diagnostic_card(self, axis: str, text: str) -> None:
         changed = False
         with self._lock:
@@ -79,7 +82,7 @@ class ParamAdvisor:
                 self._diagnostics[axis] = text
                 changed = True
         if changed:
-            HUB.publish("proposal", {"refresh": True})
+            self._publish_proposals()
 
     def clear_diagnostic_card(self, axis: str) -> None:
         changed = False
@@ -88,7 +91,7 @@ class ParamAdvisor:
                 del self._diagnostics[axis]
                 changed = True
         if changed:
-            HUB.publish("proposal", {"refresh": True})
+            self._publish_proposals()
 
     def clear(self) -> None:
         with self._lock:
@@ -144,7 +147,7 @@ class ParamAdvisor:
         )
         with self._lock:
             self._proposals[prop.id] = prop
-        HUB.publish("proposal", asdict(prop))
+        self._publish_proposals()
         return prop
 
     # ------------------------------------------------------------------ #
@@ -165,7 +168,7 @@ class ParamAdvisor:
             with self._lock:
                 prop.state = ProposalState.REJECTED
                 prop.safety_note = f"Re-validation failed at write time: {recheck.reason}"
-            HUB.publish("proposal", asdict(prop))
+            self._publish_proposals()
             return prop
 
         with self._lock:
@@ -192,7 +195,7 @@ class ParamAdvisor:
             with self._lock:
                 prop.state = ProposalState.FAILED
                 prop.safety_note = f"Write failed: {exc}"
-        HUB.publish("proposal", asdict(prop))
+        self._publish_proposals()
         return prop
 
     # ------------------------------------------------------------------ #
@@ -228,7 +231,7 @@ class ParamAdvisor:
                 f"Reverted {prop.param} from {wrote:g} back to its pre-write "
                 f"value {prop.current_value:g}."
             )
-        HUB.publish("proposal", asdict(prop))
+        self._publish_proposals()
         return prop
 
 
@@ -237,6 +240,7 @@ class ParamAdvisor:
     def dismiss(self, proposal_id: str) -> None:
         with self._lock:
             self._proposals.pop(proposal_id, None)
+        self._publish_proposals()
 
     def list_proposals(self) -> list[dict]:
         with self._lock:

@@ -86,32 +86,9 @@ function timeAgo(epochMs, nowMs) {
  * the pilot still has to Approve & Write there. Nothing here writes.
  */
 export default function AlertStack() {
-  const [alerts, setAlerts] = useState([]);
   const [recos, setRecos] = useState([]);
   const [prompt, setPrompt] = useState(null);
   const [error, setError] = useState(null);
-  const [now, setNow] = useState(Date.now());
-
-  // Tick so the relative "Xs ago" labels stay current without new events.
-  useEffect(() => {
-    const id = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(id);
-  }, []);
-
-  useTelemetryChannel('alert', (d, _t, _ch, ts) => {
-    if (!d) {
-      setAlerts([]);
-      return;
-    }
-    if (d.source === 'ekf' || d.source === 'vibration') return;
-
-    const atMs = ts != null ? ts * 1000 : Date.now();
-    setAlerts((prev) => {
-      // Filter out any alert with the exact same text to prevent duplicates
-      const filtered = prev.filter((a) => a.text !== d.text);
-      return [{ ...d, id: Date.now() + Math.random(), atMs }, ...filtered].slice(0, MAX_ALERTS);
-    });
-  });
 
   useTelemetryChannel('recommendation', (d) => {
     if (!d) {
@@ -166,8 +143,8 @@ export default function AlertStack() {
           <BellIcon />
           Flight Advisories
         </h2>
-        {(alerts.length > 0 || recos.length > 0 || prompt) && (
-          <button className="btn" style={{ padding: '4px 8px', fontSize: '0.72rem', borderRadius: '6px' }} onClick={() => { setAlerts([]); setRecos([]); setPrompt(null); }}>
+        {(recos.length > 0 || prompt) && (
+          <button className="btn" style={{ padding: '4px 8px', fontSize: '0.72rem', borderRadius: '6px' }} onClick={() => { setRecos([]); setPrompt(null); }}>
             Clear all
           </button>
         )}
@@ -221,48 +198,11 @@ export default function AlertStack() {
             <div style={{ flexGrow: 1 }}>{error}</div>
           </div>
         )}
-        {alerts.length === 0 && recos.length === 0 && !prompt && (
+        {recos.length === 0 && !prompt && (
           <div className="muted" style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-            <span>No advisories. Telemetry nominal.</span>
+            <span>No recommendations. Telemetry nominal.</span>
           </div>
         )}
-        {alerts.map((a) => (
-          <div key={a.id} className={`alert ${a.severity || 'info'}`} style={{ display: 'flex', gap: '10px', alignItems: 'flex-start' }}>
-            <div style={{ marginTop: '2px', flexShrink: 0 }}>
-              {getAlertIcon(a.severity)}
-            </div>
-            <div style={{ flexGrow: 1 }}>
-              <div className="row spread" style={{ marginBottom: '4px' }}>
-                {a.source && <strong style={{ textTransform: 'uppercase', fontSize: '0.7rem', color: 'var(--text-mid)' }}>{a.source}</strong>}
-                {a.atMs && <span className="muted" style={{ fontSize: '0.7rem' }}>{timeAgo(a.atMs, now)}</span>}
-              </div>
-              <div style={{ wordBreak: 'break-word', color: 'var(--text-hi)' }}>{a.text}</div>
-              {a.type === 'saturation' && (
-                <details style={{ marginTop: '8px', fontSize: '0.78rem', borderTop: '1px dashed rgba(255,255,255,0.15)', paddingTop: '6px' }}>
-                  <summary style={{ cursor: 'pointer', color: 'var(--accent)', fontWeight: 500, outline: 'none' }}>
-                    Troubleshooting details
-                  </summary>
-                  <div style={{ marginTop: '6px', display: 'flex', flexDirection: 'column', gap: '6px', color: 'var(--text-mid)' }}>
-                    <p style={{ margin: 0 }}>
-                      The control coherence in the 0.5-3.0 Hz band is low ({a.coherence}), indicating actuator saturation is actively degrading stabilization.
-                    </p>
-                    <p style={{ margin: 0, fontWeight: 500 }}>
-                      ⚠️ Inspect propellers, shafts, and frame stiffness. Do not increase P-gain while saturation is present.
-                    </p>
-                    <div style={{ marginTop: '2px' }}>
-                      <a href="https://docs.px4.io/main/en/config_mc/pid_tuning_guide_multicopter.html#actuator-saturation"
-                         target="_blank"
-                         rel="noopener noreferrer"
-                         style={{ color: 'var(--accent)', textDecoration: 'underline', display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
-                        PX4 Saturation Documentation
-                      </a>
-                    </div>
-                  </div>
-                </details>
-              )}
-            </div>
-          </div>
-        ))}
       </div>
     </div>
   );

@@ -14,29 +14,71 @@ from ..core import config
 
 _SAT_EPS = config.SAT_EPS
 _BURST_WARN_S = config.BURST_WARN_S
-
+_PWM_MIN = config.DOMAINS_PWM_MIN
+_PWM_MID = config.DOMAINS_PWM_MID
+_PWM_RANGE = config.DOMAINS_PWM_RANGE
 
 
 def _get_channel_limits(params: dict | None, ch: int) -> tuple[float, float, float]:
-    """Get min, max, trim limits for a channel (0-indexed)."""
-    p_min = 1000.0
-    p_max = 2000.0
-    p_trim = 1500.0
+    """Get min, max, trim limits for a channel (0-indexed).
+
+    Returns values in the same native scale as actuator_outputs in the ULog —
+    µs for real hardware (PWM/ACT_FUNC), raw Gazebo units for SIM_GZ.
+    """
+    p_min = _PWM_MIN
+    p_max = _PWM_MIN + _PWM_RANGE * 2
+    p_trim = _PWM_MID
 
     if not params:
         return p_min, p_max, p_trim
 
+    # SIM_GZ: parameters and actuator_outputs share the same native Gazebo
+    # scale (0–MAX), no µs offset applied.
+    if "SIM_GZ_EC_FUNC1" in params:
+        num_esc = 0
+        for i in range(1, 9):
+            if params.get(f"SIM_GZ_EC_FUNC{i}", 0):
+                num_esc = max(num_esc, i)
+        if ch < num_esc:
+            idx = ch + 1
+            p_min = float(params.get(f"SIM_GZ_EC_MIN{idx}", 0.0))
+            p_max = float(params.get(f"SIM_GZ_EC_MAX{idx}", 1000.0))
+            p_trim = float(params.get(f"SIM_GZ_EC_DIS{idx}", 0.0))
+        else:
+            idx = ch - num_esc + 1
+            p_min = float(params.get(f"SIM_GZ_SV_MIN{idx}", 0.0))
+            p_max = float(params.get(f"SIM_GZ_SV_MAX{idx}", 1000.0))
+            p_trim = float(params.get(f"SIM_GZ_SV_DIS{idx}", 500.0))
+        return p_min, p_max, p_trim
+
     ch_1 = ch + 1
-    min_keys = [f"OUT_MAIN_MIN{ch_1}", f"PWM_MAIN_MIN{ch_1}"]
-    max_keys = [f"OUT_MAIN_MAX{ch_1}", f"PWM_MAIN_MAX{ch_1}"]
-    trim_keys = [f"OUT_MAIN_TRIM{ch_1}", f"PWM_MAIN_TRIM{ch_1}"]
 
-    if ch >= 8:
-        ch_aux = ch_1 - 8
-        min_keys.extend([f"OUT_AUX_MIN{ch_aux}", f"PWM_AUX_MIN{ch_aux}"])
-        max_keys.extend([f"OUT_AUX_MAX{ch_aux}", f"PWM_AUX_MAX{ch_aux}"])
-        trim_keys.extend([f"OUT_AUX_TRIM{ch_aux}", f"PWM_AUX_TRIM{ch_aux}"])
+    # ACT_FUNC (newer PX4 centralized outputs) uses OUT{n}_MIN/MAX/TRIM.
+    # Check this first so it takes priority over PWM_MAIN on shared channels.
+    if "ACT_FUNC1" in params:
+        out_min = params.get(f"OUT{ch_1}_MIN")
+        out_max = params.get(f"OUT{ch_1}_MAX")
+        out_trim = params.get(f"OUT{ch_1}_TRIM")
+        if out_min is not None:
+            p_min = float(out_min)
+        if out_max is not None:
+            p_max = float(out_max)
+        if out_trim is not None:
+            p_trim = float(out_trim)
+        return p_min, p_max, p_trim
 
+    # PWM / HIL: main outputs on channels 0–7, aux on 8–15.
+    if ch < 8:
+        min_keys = [f"PWM_MAIN_MIN{ch_1}"]
+        max_keys = [f"PWM_MAIN_MAX{ch_1}"]
+        trim_keys = [f"PWM_MAIN_TRIM{ch_1}"]
+    else:
+        ch_aux = ch - 7
+        min_keys = [f"PWM_AUX_MIN{ch_aux}"]
+        max_keys = [f"PWM_AUX_MAX{ch_aux}"]
+        trim_keys = [f"PWM_AUX_TRIM{ch_aux}"]
+
+    # HIL fallback: OUT{n}_MIN/MAX/TRIM mirrors ACT_FUNC naming.
     min_keys.append(f"OUT{ch_1}_MIN")
     max_keys.append(f"OUT{ch_1}_MAX")
     trim_keys.append(f"OUT{ch_1}_TRIM")

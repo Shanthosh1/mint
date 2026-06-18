@@ -69,12 +69,19 @@ body {
   box-shadow: 0 0 12px rgba(248, 113, 113, 0.25);
 }
 .telemetry-stale-banner {
-  background: rgba(248, 113, 113, 0.12);
+  position: fixed;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10000;
+  width: calc(100% - 32px);
+  max-width: 800px;
+  background: rgba(12, 19, 34, 0.95);
+  backdrop-filter: blur(12px);
   border: 1px solid var(--crit);
   color: var(--crit);
   border-radius: var(--radius);
   padding: 12px 18px;
-  margin-bottom: 18px;
   text-align: center;
   font-weight: 600;
   font-size: 0.85rem;
@@ -83,7 +90,7 @@ body {
   align-items: center;
   justify-content: center;
   gap: 8px;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5), 0 0 15px rgba(248, 113, 113, 0.2);
 }
 .topbar .logo { font-weight: 700; font-size: 1.15rem; letter-spacing: 0.02em; }
 

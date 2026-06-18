@@ -56,7 +56,7 @@ _PHASE_LAG_STEADY_MAX = 0.4  # steady avg must be healthy (else it's noise)
 
 # EKF feed staleness (a dead estimator stream, distinct from bad ratios).
 _STALE_CHECK_S = 0.5         # how often to test the EKF feed age
-_STALE_MAX_AGE_S = 2.0       # no EKF_STATUS_REPORT this long => UNKNOWN
+_STALE_MAX_AGE_S = 4.0       # PX4 SITL EKF messages can gap 2-3s naturally
 
 
 class EkfMonitor:

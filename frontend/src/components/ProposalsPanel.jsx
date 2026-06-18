@@ -63,6 +63,8 @@ export default function ProposalsPanel() {
       if (d.clear) {
         // Disconnect cleared all proposals on backend — reset UI instantly
         setProposals([]);
+      } else if (d.proposals) {
+        setProposals(d.proposals);
       } else {
         refresh();
       }

@@ -8,6 +8,9 @@ engines, and opens the default browser pointed at the UI.
 """
 from __future__ import annotations
 
+import os
+os.environ["MAVLINK20"] = "1"
+
 import logging
 import webbrowser
 from contextlib import asynccontextmanager

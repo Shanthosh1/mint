@@ -124,6 +124,8 @@ export default function LiveLoopChart({ loop = 'rate', axis = 'roll' }) {
   const targetRef = useRef(null);
   const zoomedRef = useRef(false);
   const [zoomed, setZoomed] = useState(false);
+  const lastDrawTime = useRef(0);
+  const timeoutRef = useRef(null);
 
   // Sync ref → state for the reset button (debounced via rAF)
   const syncZoomState = useCallback(() => setZoomed(zoomedRef.current), []);
@@ -179,7 +181,16 @@ export default function LiveLoopChart({ loop = 'rate', axis = 'roll' }) {
       }
     });
     ro.observe(el.current);
-    return () => { ro.disconnect(); plot.current?.destroy(); };
+    return () => {
+      ro.disconnect();
+      plot.current?.destroy();
+      cancelAnimationFrame(raf.current);
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+        timeoutRef.current = null;
+      }
+      lastDrawTime.current = 0;
+    };
   }, [loop, axis, zoomFactor, minZoomRangeS]);
 
   useTelemetryChannel(cfg.spCh, (d) => {
@@ -197,7 +208,14 @@ export default function LiveLoopChart({ loop = 'rate', axis = 'roll' }) {
       targetRef.current = null;
       zoomedRef.current = false;
       setZoomed(false);
+      
       cancelAnimationFrame(raf.current);
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+        timeoutRef.current = null;
+      }
+      lastDrawTime.current = 0;
+      
       raf.current = requestAnimationFrame(() =>
         plot.current?.setData([[], [], []]));
       return;
@@ -206,30 +224,57 @@ export default function LiveLoopChart({ loop = 'rate', axis = 'roll' }) {
     if (v === null || v === undefined || Number.isNaN(v)) return;
     const b = buf.current;
     b.t.push(ts); b.actual.push(v); b.target.push(targetRef.current);
-    const maxBufferS = 300; // Keep up to 5 minutes of historical data so zoom remains visible
+    const maxBufferS = 120; // Keep up to 2 minutes of historical data (down from 5 minutes)
     while (b.t.length && b.t[0] < ts - maxBufferS) {
       b.t.shift(); b.actual.shift(); b.target.shift();
     }
-    cancelAnimationFrame(raf.current);
-    raf.current = requestAnimationFrame(() => {
+
+    const now = Date.now();
+    const timeSinceLastDraw = now - lastDrawTime.current;
+
+    const draw = (drawTime) => {
       const u = plot.current;
       if (!u) return;
+
+      lastDrawTime.current = drawTime;
+
       if (zoomedRef.current) {
-        // When zoomed, keep the user's X scale — only update data and redraw
         u.setData([b.t, b.actual, b.target], false);
         u.redraw();
       } else {
-        // Auto-scroll: show the latest windowS seconds
         u.setData([b.t, b.actual, b.target], false);
-        u.setScale('x', { min: ts - windowS, max: ts });
+        const latestTs = b.t.length ? b.t[b.t.length - 1] : ts;
+        u.setScale('x', { min: latestTs - windowS, max: latestTs });
       }
-      syncZoomState();
-    });
+    };
+
+    const scheduleDraw = () => {
+      cancelAnimationFrame(raf.current);
+      raf.current = requestAnimationFrame(() => {
+        draw(Date.now());
+      });
+    };
+
+    if (timeSinceLastDraw >= 50) {
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+        timeoutRef.current = null;
+      }
+      scheduleDraw();
+    } else {
+      if (!timeoutRef.current) {
+        const delay = 50 - timeSinceLastDraw;
+        timeoutRef.current = setTimeout(() => {
+          timeoutRef.current = null;
+          scheduleDraw();
+        }, delay);
+      }
+    }
   });
 
   return (
-    <div style={{ position: 'relative' }}>
-      <div ref={el} />
+    <div style={{ position: 'relative', minHeight: '220px' }}>
+      <div ref={el} style={{ minHeight: '220px' }} />
       {zoomed && (
         <button
           className="btn zoom-reset-btn"

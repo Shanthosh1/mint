@@ -24,6 +24,9 @@ from typing import Optional
 from mavsdk import System
 from mavsdk.param import ParamError
 from grpc import RpcError
+
+import os
+os.environ["MAVLINK20"] = "1"
 from pymavlink import mavutil
 
 from ..core import config
@@ -52,9 +55,9 @@ _WATCHED_MESSAGES = {
     "ESTIMATOR_STATUS": "estimator_status",
     "VFR_HUD": "vfr_hud",
     "SYS_STATUS": "sys_status",
-    "SERVO_OUTPUT_RAW": "servo_output",   # actuation monitor (domains.py)
     "ACTUATOR_OUTPUT_STATUS": "actuator_output_status", # dynamic actuation monitor
-    "VIBRATION": "vibration",             # live vibration fields
+    "SERVO_OUTPUT_RAW": "servo_output_raw",             # fallback for SIM_GZ servo channels
+"VIBRATION": "vibration",             # live vibration fields
     "EXTENDED_SYS_STATE": "extended_sys_state",  # VTOL transition state
     "LOCAL_POSITION_NED": "local_position",       # velocity/position loops
     "POSITION_TARGET_LOCAL_NED": "position_target",  # velocity/position setpoints
@@ -71,6 +74,26 @@ _STALE_MAX_AGE_S = config.CONN_STALE_MAX_AGE_S      # channel silent longer than
 _PARAM_READ_ATTEMPTS = config.CONN_PARAM_READ_ATTEMPTS
 _PARAM_RETRY_BASE_S = config.CONN_PARAM_RETRY_BASE_S  # doubled each retry: 0.25s, 0.5s
 
+CS_TYPE_TO_NAME = {
+    0: "Custom Servo",
+    1: "Left Aileron",
+    2: "Right Aileron",
+    3: "Elevator",
+    4: "Left Elevator",
+    5: "Right Elevator",
+    6: "Rudder",
+    7: "Left Rudder",
+    8: "Right Rudder",
+    9: "Flap",
+    10: "Left Flap",
+    11: "Right Flap",
+    12: "Airbrake",
+    13: "Left Airbrake",
+    14: "Right Airbrake",
+    15: "V-Tail Left",
+    16: "V-Tail Right",
+}
+
 
 @dataclass
 class VehicleState:
@@ -79,6 +102,7 @@ class VehicleState:
     system_id: Optional[int] = None
     fw_version: Optional[str] = None     # "1.14.0" once read from MAVSDK Info
     discovery_failed: bool = False
+    actuator_family: str | None = None   # e.g. "SIM_GZ", "PWM", "ACT_FUNC"
     actuator_map: dict[str, list[int]] = field(default_factory=lambda: {
         "hover_motors": [],
         "thrust_motors": [],
@@ -86,6 +110,7 @@ class VehicleState:
         "tilt_servos": []
     })
     actuator_limits: dict[int, dict[str, float]] = field(default_factory=dict)
+    actuator_names: dict[int, str] = field(default_factory=dict)
 
 
 class ConnectionManager:
@@ -339,6 +364,7 @@ class ConnectionManager:
             "tilt_servos": []
         }
         self.state.actuator_limits = {}
+        self.state.actuator_names = {}
         self.state.discovery_failed = False
         num_esc = 0
 
@@ -371,9 +397,10 @@ class ConnectionManager:
             self._publish_airframe()
             return
 
+        self.state.actuator_family = selected_family
         airframe_class = self.state.airframe.airframe_class if self.state.airframe else "MULTIROTOR"
 
-        def map_func(func_val: int, channel_idx: int):
+        async def map_func(func_val: int, channel_idx: int):
             if 101 <= func_val <= 112:
                 # Motor
                 if airframe_class == "MULTIROTOR":
@@ -388,6 +415,13 @@ class ConnectionManager:
             elif 201 <= func_val <= 208:
                 # Servo / Surface
                 self.state.actuator_map["control_surfaces"].append(channel_idx)
+                servo_idx = func_val - 201
+                try:
+                    cs_type = int(await self.read_param(f"CA_SV_CS{servo_idx}_TYPE", attempts=1))
+                    name = CS_TYPE_TO_NAME.get(cs_type, f"Surface {servo_idx + 1}")
+                    self.state.actuator_names[channel_idx] = name
+                except Exception:
+                    self.state.actuator_names[channel_idx] = f"Surface {servo_idx + 1}"
             elif 301 <= func_val <= 308:
                 # Tilt Servo
                 self.state.actuator_map["tilt_servos"].append(channel_idx)
@@ -399,9 +433,9 @@ class ConnectionManager:
                 for i in range(1, 17):
                     try:
                         val = int(await self.read_param(f"ACT_FUNC{i}"))
-                        present_channels.add(i - 1)
                         if val > 0:
-                            map_func(val, i - 1)
+                            present_channels.add(i - 1)
+                            await map_func(val, i - 1)
                     except Exception:
                         pass
             elif selected_family == "SIM_GZ":
@@ -411,54 +445,66 @@ class ConnectionManager:
                 for i in range(1, 9):
                     try:
                         val = int(await self.read_param(f"SIM_GZ_EC_FUNC{i}"))
-                        present_channels.add(i - 1)
                         esc_values[i] = val
                         if val > 0:
+                            present_channels.add(i - 1)
                             num_esc = max(num_esc, i)
                     except Exception:
                         pass
-                
+
                 # Map EC functions to physical channels 1 to num_esc
                 for i in range(1, num_esc + 1):
                     val = esc_values.get(i, 0)
                     if val > 0:
-                        map_func(val, i - 1)
-                
-                # Map SV functions starting at num_esc
+                        await map_func(val, i - 1)
+
+                # Map SV functions at fixed offset 16 (instance 1 in ACTUATOR_OUTPUT_STATUS).
+                # PX4 sends EC and SV outputs as separate message instances each with
+                # their own 0-based channel index. We reserve slots 16..23 for instance 1
+                # so the two groups never overlap in the merged 32-slot array.
                 for j in range(1, 9):
                     try:
                         val = int(await self.read_param(f"SIM_GZ_SV_FUNC{j}"))
-                        present_channels.add(num_esc + j - 1)
                         if val > 0:
-                            map_func(val, num_esc + j - 1)
+                            present_channels.add(16 + j - 1)
+                            await map_func(val, 16 + j - 1)
                     except Exception:
                         pass
             elif selected_family == "HIL":
                 for i in range(1, 17):
                     try:
                         val = int(await self.read_param(f"HIL_ACT_FUNC{i}"))
-                        present_channels.add(i - 1)
                         if val > 0:
-                            map_func(val, i - 1)
+                            present_channels.add(i - 1)
+                            await map_func(val, i - 1)
                     except Exception:
                         pass
             elif selected_family == "PWM":
                 for i in range(1, 9):
                     try:
                         val = int(await self.read_param(f"PWM_MAIN_FUNC{i}"))
-                        present_channels.add(i - 1)
                         if val > 0:
-                            map_func(val, i - 1)
+                            present_channels.add(i - 1)
+                            await map_func(val, i - 1)
                     except Exception:
                         pass
                 for j in range(1, 9):
                     try:
                         val = int(await self.read_param(f"PWM_AUX_FUNC{j}"))
-                        present_channels.add(8 + j - 1)
                         if val > 0:
-                            map_func(val, 8 + j - 1)
+                            present_channels.add(8 + j - 1)
+                            await map_func(val, 8 + j - 1)
                     except Exception:
                         pass
+                # On IOMCU boards (Cube, Pixhawk 1/2) PX4 sends MAIN and AUX
+                # outputs as two separate ACTUATOR_OUTPUT_STATUS instances.
+                # SYS_USE_IO=1 means the IO board is active; on boards without
+                # IOMCU the parameter does not exist at all.
+                try:
+                    if int(await self.read_param("SYS_USE_IO", attempts=1)) == 1:
+                        self.state.actuator_family = "PWM_IOMCU"
+                except Exception:
+                    pass
         except Exception as exc:
             log.exception("Error scanning parameters inside family %s", selected_family)
 
@@ -485,8 +531,9 @@ class ConnectionManager:
 
             def normalize_to_pwm(val: float, role: str) -> float:
                 if selected_family == "SIM_GZ":
-                    # Gazebo simulation parameters are in 0 to 1000 range
-                    return 1000.0 + val
+                    # SIM_GZ parameters use the same native Gazebo scale as
+                    # ACTUATOR_OUTPUT_STATUS values — no offset needed.
+                    return float(val)
                 if 800 <= val <= 2200:
                     return val
                 if -1.0 <= val <= 1.0:
@@ -512,7 +559,8 @@ class ConnectionManager:
                 except Exception:
                     pass
             elif selected_family == "SIM_GZ":
-                if ch_idx < num_esc:
+                if ch_idx < 16:
+                    # Instance 0 — ESC group; ch_idx is 0-based slot within that instance
                     esc_idx = ch_idx + 1
                     try:
                         min_val = await self.read_param(f"SIM_GZ_EC_MIN{esc_idx}", attempts=1)
@@ -527,7 +575,8 @@ class ConnectionManager:
                     except Exception:
                         pass
                 else:
-                    sv_idx = ch_idx - num_esc + 1
+                    # Instance 1 — servo group; channels start at offset 16
+                    sv_idx = ch_idx - 16 + 1
                     try:
                         min_val = await self.read_param(f"SIM_GZ_SV_MIN{sv_idx}", attempts=1)
                     except Exception:
@@ -739,6 +788,50 @@ class ConnectionManager:
     # ------------------------------------------------------------------ #
     # Raw firehose (data plane, dedicated thread)
     # ------------------------------------------------------------------ #
+    def _request_message_intervals(self, conn, target_system: int, target_component: int) -> None:
+        log.info("Requesting telemetry stream intervals from System %d, Component %d", target_system, target_component)
+        # Message intervals: key: message_id, value: interval in microseconds
+        # ATTITUDE (30): 20 Hz (50,000 us)
+        # ATTITUDE_TARGET (83): 10 Hz (100,000 us)
+        # LOCAL_POSITION_NED (32): 10 Hz (100,000 us)
+        # POSITION_TARGET_LOCAL_NED (85): 10 Hz (100,000 us)
+        # EKF_STATUS_REPORT (193): 5 Hz (200,000 us)
+        # ESTIMATOR_STATUS (230): 5 Hz (200,000 us)
+        # VIBRATION (241): 5 Hz (200,000 us)
+        # SERVO_OUTPUT_RAW (36): 10 Hz (100,000 us)
+        # ACTUATOR_OUTPUT_STATUS (375): 10 Hz (100,000 us)
+        # VFR_HUD (74): 5 Hz (200,000 us)
+        intervals = {
+            30: 50000,    # ATTITUDE
+            83: 100000,   # ATTITUDE_TARGET
+            32: 100000,   # LOCAL_POSITION_NED
+            85: 100000,   # POSITION_TARGET_LOCAL_NED
+            193: 200000,  # EKF_STATUS_REPORT
+            230: 200000,  # ESTIMATOR_STATUS
+            241: 200000,  # VIBRATION
+            36: 100000,   # SERVO_OUTPUT_RAW
+            375: 100000,  # ACTUATOR_OUTPUT_STATUS
+            74: 200000,   # VFR_HUD
+        }
+        for msg_id, interval_us in intervals.items():
+            if self._stop_flag.is_set():
+                break
+            try:
+                conn.mav.command_long_send(
+                    target_system,
+                    target_component,
+                    511, # MAV_CMD_SET_MESSAGE_INTERVAL
+                    0,   # confirmation
+                    msg_id,
+                    interval_us,
+                    0, 0, 0, 0, 0
+                )
+                log.debug("Sent message interval request for msg %d: %d us", msg_id, interval_us)
+            except Exception as e:
+                log.warning("Failed to send message interval request for msg %d: %s", msg_id, e)
+            import time
+            time.sleep(0.05)
+
     def _start_pymavlink_thread(self) -> None:
         self._stop_flag.clear()
         self._mav_type_seen = False
@@ -755,9 +848,17 @@ class ConnectionManager:
             conn = mavutil.mavlink_connection(
                 f"udpin:127.0.0.1:{ROUTER.pymavlink_port}"
             )
+            import socket
+            try:
+                conn.port.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
+                log.info("Set pymavlink UDP socket receive buffer to 1MB")
+            except Exception as e:
+                log.warning("Failed to set pymavlink UDP socket RCVBUF: %s", e)
         except OSError as exc:
             log.error("pymavlink bind failed: %s", exc)
             return
+
+        rates_requested = False
 
         while not self._stop_flag.is_set():
             msg = conn.recv_match(blocking=True, timeout=1.0)
@@ -781,6 +882,16 @@ class ConnectionManager:
                                 f"MINT supports PX4 only.",
                             )
                     continue
+                if not rates_requested:
+                    rates_requested = True
+                    target_sys = msg.get_srcSystem()
+                    target_comp = msg.get_srcComponent()
+                    threading.Thread(
+                        target=self._request_message_intervals,
+                        args=(conn, target_sys, target_comp),
+                        name="telemetry-rate-request",
+                        daemon=True
+                    ).start()
                 if not self._mav_type_seen:
                     self._mav_type_seen = True
                     if self._loop and self._loop.is_running():

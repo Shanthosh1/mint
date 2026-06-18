@@ -305,7 +305,7 @@ export default function StepResponseEnvelope({ steps = [], tau, settling, oversh
               {showSpread ? 'Hide Individual Steps' : 'Show Individual Steps'}
             </button>
           </div>
-          <div ref={containerRef} style={{ width: '100%' }} />
+          <div ref={containerRef} style={{ width: '100%', minHeight: '260px' }} />
         </div>
 
         {/* Hover/metrics side panel */}

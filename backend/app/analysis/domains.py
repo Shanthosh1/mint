@@ -21,6 +21,7 @@ naturally selects which one produces meaningful output.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections import deque
 
@@ -28,6 +29,8 @@ from ..mavlink.telemetry_hub import HUB
 from ..mavlink.connection import CONNECTION
 from .regime import REGIME, Regime
 from ..core import config
+
+_log = logging.getLogger(__name__)
 
 DOMAIN_BY_CLASS = {
     "MULTIROTOR": "differential_thrust",
@@ -74,6 +77,8 @@ class ActuationMonitor:
         self._motor_hist: dict[int, deque[tuple[float, float]]] = {}
         self._last_alert: dict[str, float] = {}
         self._task: asyncio.Task | None = None
+        self._instance_buf: list[list[float]] = [[0.0] * 16, [0.0] * 16]
+        self._last_instance0_time: float = 0.0
 
     @property
     def domain(self) -> str | None:
@@ -97,18 +102,11 @@ class ActuationMonitor:
 
     # ------------------------------------------------------------------ #
     async def _run(self) -> None:
-        # ACTUATOR_OUTPUT_STATUS is the primary source (PX4 v1.13+).
-        # SERVO_OUTPUT_RAW is the legacy fallback — only used if the modern
-        # message never arrives after a grace period.
-        self._got_actuator_status = False
-        self._servo_fallback_ok = False
-        self._first_servo_at: float | None = None
         self._vtol_state = 0
-        _GRACE_PERIOD_S = 3.0  # wait this long for modern msg before fallback
 
         async for event in HUB.subscribe(channels=frozenset({
             "airframe", "vfr_hud", "extended_sys_state",
-            "actuator_output_status", "servo_output"
+            "actuator_output_status",
         })):
             if event.channel == "airframe":
                 self.domain = domain_for(event.payload.get("airframe_class"))
@@ -116,28 +114,8 @@ class ActuationMonitor:
                 self._track_airspeed(event.payload)
             elif event.channel == "extended_sys_state":
                 self._vtol_state = int(event.payload.get("vtol_state", 0) or 0)
-
             elif event.channel == "actuator_output_status":
-                # Primary source — always process, suppress legacy
-                self._got_actuator_status = True
-                self._servo_fallback_ok = False
                 self._process_actuator_status(event.payload)
-
-            elif event.channel == "servo_output":
-                if self._got_actuator_status:
-                    # Modern source is active — ignore legacy
-                    continue
-                # Grace period: suppress SERVO_OUTPUT_RAW for the first N
-                # seconds to give ACTUATOR_OUTPUT_STATUS time to arrive.
-                now = time.monotonic()
-                if self._first_servo_at is None:
-                    self._first_servo_at = now
-                if not self._servo_fallback_ok:
-                    if now - self._first_servo_at < _GRACE_PERIOD_S:
-                        continue  # still waiting for modern message
-                    # Grace period expired — modern message never came, use legacy
-                    self._servo_fallback_ok = True
-                self._process_servo_output(event.payload)
 
     def _track_airspeed(self, vfr: dict) -> None:
         now = time.monotonic()
@@ -163,50 +141,73 @@ class ActuationMonitor:
         return (self._airspeed / ref) ** 2
 
     # ------------------------------------------------------------------ #
-    def _process_servo_output(self, servo: dict) -> None:
-        raws = [float(servo.get(f"servo{i}_raw", 0) or 0) for i in range(1, 17)]
-        if not any(800 < v < 2300 for v in raws):
-            return
-        self._process_channels(raws, is_raw=True)
 
     def _process_actuator_status(self, payload: dict) -> None:
         actuator = payload.get("actuator") or []
         if not actuator:
             return
-        self._process_channels(actuator, is_raw=False)
+        import math, time
+
+        family = getattr(CONNECTION.state, "actuator_family", None)
+
+        if family == "PWM_IOMCU":
+            # IOMCU sends MAIN and AUX as two separate 8-wide messages.
+            block_size = 8
+            now = time.monotonic()
+            vals = list(actuator[:block_size]) + [0.0] * max(0, block_size - len(actuator))
+            if now - self._last_instance0_time > 0.05:
+                self._instance_buf[0] = vals
+                self._last_instance0_time = now
+            else:
+                self._instance_buf[1] = vals
+            values = self._instance_buf[0] + self._instance_buf[1]
+        else:
+            values = list(actuator)
+
+        is_raw = any(not math.isnan(v) and abs(v) > 2.0 for v in values)
+        self._process_channels(values, is_raw=is_raw)
 
     def _process_channels(self, values: list[float], is_raw: bool) -> None:
         now = time.monotonic()
-        payload: dict = {"domain": self.domain}
         
         # Determine mapping channels — exclusively from dynamic discovery
-        # (live MAVLink params, ULog initial_parameters, or manual pilot config).
-        # No hardcoded guessing: if discovery hasn't run or failed, all
-        # channels appear as "unclassified" in the UI until the pilot
-        # configures them via the manual mapping dialog.
         actuator_map = getattr(CONNECTION.state, "actuator_map", None)
         has_mapped_channels = False
         if actuator_map:
             has_mapped_channels = any(len(v) > 0 for v in actuator_map.values())
             
+        payload: dict = {
+            "domain": self.domain,
+            "motor_norms": [],
+            "motor_channels": [],
+            "thrust_norms": [],
+            "thrust_channels": [],
+            "surface_deflections": [],
+            "surface_channels": [],
+            "surface_names": [],
+            "tilt_deflections": [],
+            "tilt_channels": [],
+            "railed_channels": [],
+            "raw_channels": [],
+            "unmapped": not has_mapped_channels,
+        }
+        
         if has_mapped_channels:
             hover_channels = actuator_map.get("hover_motors", [])
             thrust_channels = actuator_map.get("thrust_motors", [])
             surface_channels = actuator_map.get("control_surfaces", [])
             tilt_channels = actuator_map.get("tilt_servos", [])
         else:
-            # No dynamic mapping available — everything is unclassified.
-            # The pilot can fix this via the manual actuator config dialog.
             hover_channels = []
             thrust_channels = []
             surface_channels = []
             tilt_channels = []
-            payload["unmapped"] = True
 
         # ---- Always include ALL mapped channels + active unmapped as raw bars ----
         classified = set(hover_channels) | set(thrust_channels) | set(surface_channels) | set(tilt_channels)
         raw_channels = []
         raw_pwms_by_ch = {}
+        no_data_surface_ch: set[int] = set()
         for i, v in enumerate(values):
             is_mapped = i in classified
             
@@ -216,12 +217,10 @@ class ActuationMonitor:
                 ch_min = limits["min"]
                 ch_max = limits["max"]
                 ch_trim = limits["trim"]
-                ch_range = max(1.0, ch_max - ch_min)
             else:
                 ch_min = _PWM_MIN
                 ch_max = _PWM_MIN + _PWM_RANGE * 2
                 ch_trim = _PWM_MID
-                ch_range = max(1.0, ch_max - ch_min)
 
             if is_raw:
                 raw_pwm = v
@@ -231,7 +230,7 @@ class ActuationMonitor:
                 is_motor = (i in hover_channels) or (i in thrust_channels)
                 if is_motor:
                     # Unidirectional mapping: [-1.0, 1.0] -> [ch_min, ch_max]
-                    raw_pwm = ch_min + (raw_v + 1.0) / 2.0 * ch_range
+                    raw_pwm = ch_min + (raw_v + 1.0) / 2.0 * (ch_max - ch_min)
                 else:
                     # Bidirectional mapping with ch_trim as center
                     if raw_v >= 0.0:
@@ -239,21 +238,25 @@ class ActuationMonitor:
                     else:
                         raw_pwm = ch_trim + raw_v * (ch_trim - ch_min)
 
-            if raw_pwm < 800:
+            if raw_pwm < ch_min:
                 norm = 0.0
             else:
-                norm = (raw_pwm - ch_min) / ch_range
+                norm = (raw_pwm - ch_min) / max(1.0, ch_max - ch_min)
                 norm = min(1.0, max(0.0, norm))
 
             raw_pwms_by_ch[i] = raw_pwm
 
             if is_raw:
-                admit = is_mapped or 800 < v < 2300
+                admit = is_mapped or v >= ch_min
             else:
                 import math
                 admit = is_mapped or (not math.isnan(v) and abs(v) > 0.001)
 
             if admit:
+                is_surface_or_tilt = (i in surface_channels) or (i in tilt_channels)
+                data_available = not (is_raw and round(raw_pwm) == 0 and is_surface_or_tilt)
+                if not data_available:
+                    no_data_surface_ch.add(i)
                 raw_channels.append({
                     "ch": i + 1,
                     "raw": round(raw_pwm),
@@ -262,6 +265,7 @@ class ActuationMonitor:
                     "max": ch_max,
                     "trim": ch_trim,
                     "classified": is_mapped,
+                    "data_available": data_available,
                 })
         payload["raw_channels"] = raw_channels
 
@@ -272,18 +276,17 @@ class ActuationMonitor:
             for ch in hover_channels:
                 if ch < len(values):
                     raw_pwm = raw_pwms_by_ch.get(ch, _PWM_MID)
-                    if raw_pwm < 800:
+                    limits = getattr(CONNECTION.state, "actuator_limits", {}).get(ch)
+                    if limits:
+                        ch_min = limits["min"]
+                        ch_max = limits["max"]
+                    else:
+                        ch_min = _PWM_MIN
+                        ch_max = _PWM_MIN + _PWM_RANGE * 2
+                    if raw_pwm < ch_min:
                         norms.append(0.0)
                     else:
-                        limits = getattr(CONNECTION.state, "actuator_limits", {}).get(ch)
-                        if limits:
-                            ch_min = limits["min"]
-                            ch_max = limits["max"]
-                        else:
-                            ch_min = _PWM_MIN
-                            ch_max = _PWM_MIN + _PWM_RANGE * 2
-                        ch_range = max(1.0, ch_max - ch_min)
-                        norms.append(min(1.0, max(0.0, (raw_pwm - ch_min) / ch_range)))
+                        norms.append(min(1.0, max(0.0, (raw_pwm - ch_min) / max(1.0, ch_max - ch_min))))
                     hover_mapped_ch.append(ch + 1)
         elif not has_mapped_channels:
             # Fallback: treat all active channels as motors for saturation check
@@ -293,6 +296,7 @@ class ActuationMonitor:
             # Heuristic to guess surface-like channels for UI raw bars
             guessed_defls = []
             guessed_surf_ch = []
+            guessed_names = []
             for ch_info in raw_channels:
                 ch_idx = ch_info["ch"] - 1
                 raw_val = ch_info["raw"]
@@ -313,16 +317,22 @@ class ActuationMonitor:
                         if not math.isnan(v) and v < -0.05:
                             is_guessed_motor = False
                 if not is_guessed_motor:
+                    ch_min = limits.get("min", _PWM_MIN) if limits else _PWM_MIN
+                    ch_max = limits.get("max", _PWM_MIN + _PWM_RANGE * 2) if limits else (_PWM_MIN + _PWM_RANGE * 2)
                     ch_trim = limits.get("trim", _PWM_MID) if limits else _PWM_MID
-                    ch_range = limits.get("range", _PWM_RANGE) if limits else _PWM_RANGE
-                    d = (raw_val - ch_trim) / ch_range
-                    d_val = min(1.0, max(-1.0, d))
-                    guessed_defls.append(round(d_val, 2))
+                    if raw_val <= ch_trim:
+                        deflection = (raw_val - ch_trim) / max(1.0, ch_trim - ch_min)
+                    else:
+                        deflection = (raw_val - ch_trim) / max(1.0, ch_max - ch_trim)
+                    deflection = min(1.0, max(-1.0, deflection))
+                    guessed_defls.append(round(deflection, 2))
                     guessed_surf_ch.append(ch_info["ch"])
+                    guessed_names.append(f"Surface {len(guessed_names) + 1}")
 
             if guessed_defls:
                 payload["surface_deflections"] = guessed_defls
                 payload["surface_channels"] = guessed_surf_ch
+                payload["surface_names"] = guessed_names
                         
         if self.domain == "hybrid" and self._vtol_state == 4:
             norms = [0.0] * len(norms)
@@ -332,7 +342,7 @@ class ActuationMonitor:
             payload["motor_sat_index"] = round(sat_index, 2)
             payload["motor_max"] = round(max(norms), 2)
             payload["motor_norms"] = [round(n, 3) for n in norms]
-            payload["motor_channels"] = hover_mapped_ch
+            payload["motor_channels"] = hover_mapped_ch if has_mapped_channels else []
             self._sustained_check("motor", sat_index > 0, now, severity="warning",
                                    text="Motor saturation: one or more motors pinned at "
                                         "maximum output. Reduce aggressive rate gains, "
@@ -349,18 +359,17 @@ class ActuationMonitor:
             for ch in thrust_channels:
                 if ch < len(values):
                     raw_pwm = raw_pwms_by_ch.get(ch, _PWM_MID)
-                    if raw_pwm < 800:
+                    limits = getattr(CONNECTION.state, "actuator_limits", {}).get(ch)
+                    if limits:
+                        ch_min = limits["min"]
+                        ch_max = limits["max"]
+                    else:
+                        ch_min = _PWM_MIN
+                        ch_max = _PWM_MIN + _PWM_RANGE * 2
+                    if raw_pwm < ch_min:
                         thrust_norms.append(0.0)
                     else:
-                        limits = getattr(CONNECTION.state, "actuator_limits", {}).get(ch)
-                        if limits:
-                            ch_min = limits["min"]
-                            ch_max = limits["max"]
-                        else:
-                            ch_min = _PWM_MIN
-                            ch_max = _PWM_MIN + _PWM_RANGE * 2
-                        ch_range = max(1.0, ch_max - ch_min)
-                        thrust_norms.append(min(1.0, max(0.0, (raw_pwm - ch_min) / ch_range)))
+                        thrust_norms.append(min(1.0, max(0.0, (raw_pwm - ch_min) / max(1.0, ch_max - ch_min))))
                     thrust_mapped_ch.append(ch + 1)
         if thrust_norms:
             payload["thrust_norms"] = [round(tn, 3) for tn in thrust_norms]
@@ -369,29 +378,41 @@ class ActuationMonitor:
         # 3. Process Control Surfaces — always include mapped channels
         defl = []
         surf_mapped_ch = []
+        surf_names = []
         if surface_channels:
             for ch in surface_channels:
                 if ch < len(values):
                     raw_pwm = raw_pwms_by_ch.get(ch, _PWM_MID)
-                    if raw_pwm < 800:
+                    limits = getattr(CONNECTION.state, "actuator_limits", {}).get(ch)
+                    if limits:
+                        ch_min = limits["min"]
+                        ch_max = limits["max"]
+                        ch_trim = limits["trim"]
+                    else:
+                        ch_min = _PWM_MIN
+                        ch_max = _PWM_MIN + _PWM_RANGE * 2
+                        ch_trim = _PWM_MID
+                    if raw_pwm < ch_min:
                         defl.append(0.0)
                     else:
-                        limits = getattr(CONNECTION.state, "actuator_limits", {}).get(ch)
-                        if limits:
-                            ch_trim = limits["trim"]
-                            ch_range = limits["range"]
+                        if raw_pwm <= ch_trim:
+                            deflection = (raw_pwm - ch_trim) / max(1.0, ch_trim - ch_min)
                         else:
-                            ch_trim = _PWM_MID
-                            ch_range = _PWM_RANGE
-                        d = (raw_pwm - ch_trim) / ch_range
-                        defl.append(min(1.0, max(-1.0, d)))
+                            deflection = (raw_pwm - ch_trim) / max(1.0, ch_max - ch_trim)
+                        deflection = min(1.0, max(-1.0, deflection))
+                        defl.append(deflection)
                     surf_mapped_ch.append(ch + 1)
-                        
+                    name = getattr(CONNECTION.state, "actuator_names", {}).get(ch, f"Surface {len(surf_names) + 1}")
+                    surf_names.append(name)
+
         if defl:
-            railed = [i for i, d in enumerate(defl) if abs(d) >= _SURFACE_RAIL]
+            # Skip channels with no upstream data from the railing check.
+            railed = [i for i, d in enumerate(defl)
+                      if abs(d) >= _SURFACE_RAIL and surface_channels[i] not in no_data_surface_ch]
             q_ratio = self._reference_q_ratio()
             payload["surface_deflections"] = [round(d, 2) for d in defl]
             payload["surface_channels"] = surf_mapped_ch
+            payload["surface_names"] = surf_names
             payload["railed_channels"] = railed
             payload["q_ratio"] = round(q_ratio, 2) if q_ratio is not None else None
 
@@ -418,18 +439,24 @@ class ActuationMonitor:
             for ch in tilt_channels:
                 if ch < len(values):
                     raw_pwm = raw_pwms_by_ch.get(ch, _PWM_MID)
-                    if raw_pwm < 800:
+                    limits = getattr(CONNECTION.state, "actuator_limits", {}).get(ch)
+                    if limits:
+                        ch_min = limits["min"]
+                        ch_max = limits["max"]
+                        ch_trim = limits["trim"]
+                    else:
+                        ch_min = _PWM_MIN
+                        ch_max = _PWM_MIN + _PWM_RANGE * 2
+                        ch_trim = _PWM_MID
+                    if raw_pwm < ch_min:
                         tilt_defl.append(0.0)
                     else:
-                        limits = getattr(CONNECTION.state, "actuator_limits", {}).get(ch)
-                        if limits:
-                            ch_trim = limits["trim"]
-                            ch_range = limits["range"]
+                        if raw_pwm <= ch_trim:
+                            deflection = (raw_pwm - ch_trim) / max(1.0, ch_trim - ch_min)
                         else:
-                            ch_trim = _PWM_MID
-                            ch_range = _PWM_RANGE
-                        d = (raw_pwm - ch_trim) / ch_range
-                        tilt_defl.append(min(1.0, max(-1.0, d)))
+                            deflection = (raw_pwm - ch_trim) / max(1.0, ch_max - ch_trim)
+                        deflection = min(1.0, max(-1.0, deflection))
+                        tilt_defl.append(deflection)
                     tilt_mapped_ch.append(ch + 1)
         if tilt_defl:
             payload["tilt_deflections"] = [round(td, 2) for td in tilt_defl]

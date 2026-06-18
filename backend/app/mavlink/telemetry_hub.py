@@ -36,7 +36,7 @@ class Event:
 _REPLAY_CHANNELS: frozenset[str] = frozenset({
     "connection", "airframe", "regime", "flight_mode", "cascade_state",
     "ekf_metrics", "loop_metrics", "vibration_metrics", "telemetry_stale",
-    "actuation",
+    "actuation", "proposal",
 })
 
 

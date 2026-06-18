@@ -102,12 +102,27 @@ export default function ActuatorPanel() {
   const thrust_channels = act?.thrust_channels;
   const surfaces = act?.surface_deflections;
   const surface_channels = act?.surface_channels;
+  const surface_names = act?.surface_names;
   const tilts = act?.tilt_deflections;
   const tilt_channels = act?.tilt_channels;
   const railed = new Set(act?.railed_channels ?? []);
   const balance = act?.motor_balance;
   const rawChannels = act?.raw_channels ?? [];
   const unmapped = act?.unmapped;
+
+  const surfaceDefMap = {};
+  if (surface_channels && surfaces) {
+    surface_channels.forEach((chNum, index) => {
+      surfaceDefMap[chNum] = surfaces[index] ?? 0;
+    });
+  }
+
+  const tiltDefMap = {};
+  if (tilt_channels && tilts) {
+    tilt_channels.forEach((chNum, index) => {
+      tiltDefMap[chNum] = tilts[index] ?? 0;
+    });
+  }
 
   // Saturated actuators calculation for combining outputs & saturation status
   const motorSaturatedCount = motors ? motors.filter(n => n >= sat).length : 0;
@@ -116,6 +131,15 @@ export default function ActuatorPanel() {
   const hasSaturatedActuators = saturatedChannelsCount > 0;
 
   const getChannelInfo = (chNum) => {
+    if (unmapped) {
+      if (surface_channels && surface_channels.includes(chNum)) {
+        const idx = surface_channels.indexOf(chNum);
+        const customLabel = surface_names?.[idx] || `Surface ${idx + 1}`;
+        return { label: customLabel, type: 'Surface', isServo: true };
+      }
+      return { label: `Ch${chNum}`, type: 'Unclassified', isServo: false };
+    }
+
     if (motor_channels && motor_channels.includes(chNum)) {
       const idx = motor_channels.indexOf(chNum);
       return { label: `M${idx + 1}`, type: 'Motor', isServo: false };
@@ -126,7 +150,8 @@ export default function ActuatorPanel() {
     }
     if (surface_channels && surface_channels.includes(chNum)) {
       const idx = surface_channels.indexOf(chNum);
-      return { label: `S${idx + 1}`, type: 'Surface', isServo: true };
+      const customLabel = surface_names?.[idx] || `S${idx + 1}`;
+      return { label: customLabel, type: 'Surface', isServo: true };
     }
     if (tilt_channels && tilt_channels.includes(chNum)) {
       const idx = tilt_channels.indexOf(chNum);
@@ -180,7 +205,7 @@ export default function ActuatorPanel() {
 
       {unmapped && rawChannels.length > 0 && (
         <div className="alert warning" style={{ marginBottom: 12, fontSize: '0.8rem' }}>
-          ⚠ Actuator mapping not available — all channels shown as unclassified.
+          ⚠ Actuator mapping not available — fallback to guessed surfaces and unclassified channels.
           Use the <strong>Connection panel → Configure Actuators</strong> to assign
           channel roles (motors, surfaces, tilts).
         </div>
@@ -191,7 +216,26 @@ export default function ActuatorPanel() {
         <div className="stack" style={{ gap: 10 }}>
           {rawChannels.map((rc) => {
             const info = getChannelInfo(rc.ch);
-            const textVal = showPercentage ? `${Math.round(rc.norm * 100)}%` : `${rc.raw} µs`;
+            
+            let val = undefined;
+            if (info.isServo) {
+              if (info.type === 'Tilt') {
+                val = tiltDefMap[rc.ch] ?? 0;
+              } else {
+                val = surfaceDefMap[rc.ch] ?? 0;
+              }
+            }
+
+            let textVal = '';
+            if (showPercentage) {
+              if (info.isServo) {
+                textVal = rc.data_available === false ? 'N/A' : `${Math.round(val * 100)}%`;
+              } else {
+                textVal = `${Math.round(rc.norm * 100)}%`;
+              }
+            } else {
+              textVal = rc.data_available === false ? 'N/A' : `${rc.raw} µs`;
+            }
             
             return (
               <div key={rc.ch}>
@@ -204,7 +248,7 @@ export default function ActuatorPanel() {
                     </span>
                   }
                   bipolar={info.isServo}
-                  val={info.isServo ? (rc.norm - 0.5) * 2.0 : undefined}
+                  val={info.isServo ? val : undefined}
                   frac={info.isServo ? undefined : rc.norm}
                   text={textVal}
                   warn={warn}
