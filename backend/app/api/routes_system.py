@@ -103,7 +103,7 @@ async def router_stop() -> dict:
 
 @router.post("/vehicle/connect")
 async def vehicle_connect() -> dict:
-    """Begin the MAVSDK handshake against the routed endpoint."""
+    """Begin the MAVLink handshake against the routed endpoint."""
     if not ROUTER.is_running:
         raise HTTPException(409, "Start the telemetry router first")
     try:

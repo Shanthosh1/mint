@@ -5,12 +5,11 @@ mavp2p (https://github.com/bluenviron/mavp2p) is a cross-platform Go
 MAVLink router — chosen over mavlink-routerd, whose epoll-based core
 does not run on Windows or macOS.
 
-One MAVLink *source* is fanned out to up to three loopback UDP endpoints:
+One MAVLink *source* is fanned out to up to two loopback UDP endpoints:
 
     source (serial / UDP / TCP)
         ├── 127.0.0.1:14550   QGroundControl
-        ├── 127.0.0.1:14540   MAVSDK-Python  (params / commands)
-        └── 127.0.0.1:14541   pymavlink      (raw message firehose)
+        └── 127.0.0.1:14541   pymavlink      (raw message firehose & control)
 
 Supported source modes (ConnectionTarget.mode):
     serial       USB / radio modem            serial:<device>:<baud>
@@ -19,17 +18,12 @@ Supported source modes (ConnectionTarget.mode):
     tcp_connect  serial-over-ethernet, SITL   tcpc:<host>:<port>
 
 When the source is a local UDP listener its port may collide with one of
-the loopback fan-out ports (e.g. SITL's API stream on 14540). Collisions
+the loopback fan-out ports (e.g. SITL's API stream on 14550 or 14541). Collisions
 are resolved automatically: the QGC output is dropped when the source
 already owns 14550 (QGC is then talking to the vehicle directly), and
-the MAVSDK/pymavlink outputs are shifted to alternate ports. The live
-port assignment is exposed via `mavsdk_port` / `pymavlink_port` so the
+the pymavlink output is shifted to alternate ports. The live
+port assignment is exposed via `pymavlink_port` so the
 connection layer always binds the right sockets.
-
-The separate pymavlink endpoint exists because MAVSDK and pymavlink
-cannot bind the same UDP socket, and pymavlink is needed for messages
-MAVSDK does not surface (ATTITUDE_TARGET, MANUAL_CONTROL,
-EKF_STATUS_REPORT).
 """
 from __future__ import annotations
 
@@ -47,7 +41,6 @@ log = logging.getLogger("mint.router")
 ConnectionMode = Literal["serial", "udp_listen", "udp_connect", "tcp_connect"]
 
 # Fallback ports used when a udp_listen source collides with a default.
-_ALT_MAVSDK_PORT = 14542
 _ALT_PYMAVLINK_PORT = 14543
 
 
@@ -109,7 +102,6 @@ class RouterManager:
         self._last_error: Optional[str] = None
         self._lock = asyncio.Lock()
         # Active fan-out ports — re-resolved on every start().
-        self.mavsdk_port: int = config.MAVSDK_UDP_PORT
         self.pymavlink_port: int = config.PYMAVLINK_UDP_PORT
         self._qgc_enabled: bool = True
 
@@ -136,13 +128,12 @@ class RouterManager:
                 # requests would just add noise to the link.
                 "--streamreq-disable",
                 # Don't inject mavp2p's own GCS heartbeats — QGC and the
-                # MAVSDK backend already provide them.
+                # connection manager already provide them.
                 "--hb-disable",
                 target.source_endpoint(),
             ]
             if self._qgc_enabled:
                 cmd.append(f"udpc:127.0.0.1:{config.QGC_UDP_PORT}")
-            cmd.append(f"udpc:127.0.0.1:{self.mavsdk_port}")
             cmd.append(f"udpc:127.0.0.1:{self.pymavlink_port}")
             log.info("Launching router: %s", " ".join(cmd))
 
@@ -203,7 +194,6 @@ class RouterManager:
         if self.is_running:
             if self._qgc_enabled:
                 endpoints.append(f"127.0.0.1:{config.QGC_UDP_PORT} (QGC)")
-            endpoints.append(f"127.0.0.1:{self.mavsdk_port} (MAVSDK)")
             endpoints.append(f"127.0.0.1:{self.pymavlink_port} (analyzer)")
         return RouterStatus(
             running=self.is_running,
@@ -223,17 +213,11 @@ class RouterManager:
     def _resolve_ports(self, target: ConnectionTarget) -> None:
         """Pick fan-out ports that cannot collide with a local UDP source.
 
-        Typical case: PX4 SITL's API stream targets 14540. Listening there
-        means MAVSDK must move to the alternate port; likewise a source on
-        14550 means QGC is already receiving the vehicle stream directly,
+        Typical case: PX4 SITL's API stream targets 14550. Listening there
+        means QGC is already receiving the vehicle stream directly,
         so forwarding to it would only create a feedback loop.
         """
         self._qgc_enabled = not target._listens_locally_on(config.QGC_UDP_PORT)
-        self.mavsdk_port = (
-            _ALT_MAVSDK_PORT
-            if target._listens_locally_on(config.MAVSDK_UDP_PORT)
-            else config.MAVSDK_UDP_PORT
-        )
         self.pymavlink_port = (
             _ALT_PYMAVLINK_PORT
             if target._listens_locally_on(config.PYMAVLINK_UDP_PORT)

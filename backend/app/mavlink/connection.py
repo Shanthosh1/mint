@@ -20,10 +20,8 @@ import logging
 import threading
 from dataclasses import dataclass, field
 from typing import Optional
-
-from mavsdk import System
-from mavsdk.param import ParamError
-from grpc import RpcError
+import struct
+import time
 
 import os
 os.environ["MAVLINK20"] = "1"
@@ -111,14 +109,37 @@ class VehicleState:
     })
     actuator_limits: dict[int, dict[str, float]] = field(default_factory=dict)
     actuator_names: dict[int, str] = field(default_factory=dict)
+def _safe_set_result(fut: asyncio.Future, val) -> None:
+    if not fut.done():
+        fut.set_result(val)
+
+
+def _safe_set_exception(fut: asyncio.Future, exc: Exception) -> None:
+    if not fut.done():
+        fut.set_exception(exc)
+
+
+def _extract_param_value(msg) -> float:
+    val = msg.param_value
+    ptype = getattr(msg, "param_type", None)
+    if ptype is not None and 1 <= ptype <= 8:
+        try:
+            packed = struct.pack('f', val)
+            if ptype in (1, 3, 5):
+                return float(struct.unpack('I', packed)[0])
+            else:
+                return float(struct.unpack('i', packed)[0])
+        except Exception:
+            pass
+    return float(val)
 
 
 class ConnectionManager:
-    """Owns the MAVSDK system object and the pymavlink listener thread."""
+    """Owns the pymavlink system connection and the receive thread."""
 
     def __init__(self) -> None:
         self.state = VehicleState()
-        self._system: Optional[System] = None
+        self._pymav_conn: Optional[mavutil.mavfile] = None
         self._pymav_thread: Optional[threading.Thread] = None
         self._stop_flag = threading.Event()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -127,48 +148,103 @@ class ConnectionManager:
         self._last_mode: tuple[int, bool] | None = None
         self._watchdog: Optional[asyncio.Task] = None
         self._conn_monitor: Optional[asyncio.Task] = None
+        self._heartbeat_task: Optional[asyncio.Task] = None
+        self._param_cache: dict[str, float] | None = None
+
+        self._target_system: Optional[int] = None
+        self._target_component: Optional[int] = None
+        self._connected_future: Optional[asyncio.Future[tuple[int, int]]] = None
+        self._pending_version_read: Optional[asyncio.Future[object]] = None
+        self._pending_param_reads: dict[str, asyncio.Future[float]] = {}
+        self._pending_param_writes: dict[str, asyncio.Future[float]] = {}
+        self._last_heartbeat_time: float = 0.0
+
+        # Bulk download variables
+        self._bulk_download_active: bool = False
+        self._bulk_params: dict[str, float] = {}
+        self._bulk_param_count: int = -1
+        self._bulk_event: Optional[asyncio.Event] = None
 
     # ------------------------------------------------------------------ #
     # Lifecycle
     # ------------------------------------------------------------------ #
     async def connect(self) -> VehicleState:
-        """Connect MAVSDK to the routed UDP endpoint and start the raw listener.
+        """Connect to the routed UDP endpoint using pymavlink and start the receive loop.
 
         Ports come from the RouterManager, not static config: a udp_listen
         source (e.g. local SITL) may have shifted the fan-out to alternate
         ports to avoid colliding with the source socket.
         """
         self._loop = asyncio.get_running_loop()
-        mavsdk_url = f"udpin://0.0.0.0:{ROUTER.mavsdk_port}"
+        pymav_url = f"udpin:127.0.0.1:{ROUTER.pymavlink_port}"
 
-        self._system = System(mavsdk_server_address=None)
-        await self._system.connect(system_address=mavsdk_url)
+        # Initialize futures and collections
+        self._connected_future = self._loop.create_future()
+        self._pending_version_read = None
+        self._pending_param_reads = {}
+        self._pending_param_writes = {}
+        self._bulk_download_active = False
+        self._bulk_params = {}
+        self._bulk_param_count = -1
+        self._bulk_event = None
 
-        log.info("Waiting for vehicle heartbeat on %s ...", mavsdk_url)
-        async for cs in self._system.core.connection_state():
-            if cs.is_connected:
-                break
+        log.info("Opening pymavlink connection on %s ...", pymav_url)
+        try:
+            self._pymav_conn = mavutil.mavlink_connection(pymav_url, source_system=251)
+            import socket
+            try:
+                self._pymav_conn.port.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
+                log.info("Set pymavlink UDP socket receive buffer to 1MB")
+            except Exception as e:
+                log.warning("Failed to set pymavlink UDP socket RCVBUF: %s", e)
+        except Exception as exc:
+            log.error("pymavlink connection open failed: %s", exc)
+            self._pymav_conn = None
+            raise ConnectionError(f"Failed to open pymavlink connection: {exc}")
 
-        # Gate on PX4 + firmware version BEFORE marking connected or starting
-        # any analysis. A non-PX4 stack or pre-1.14 firmware is rejected here
-        # so the engines never see telemetry they would misinterpret.
+        # Start background receive loop early to handle connection/HEARTBEAT
+        self._start_pymavlink_thread()
+
+        # Start GCS heartbeat sender task to register routing in the vehicle
+        self._heartbeat_task = asyncio.create_task(
+            self._heartbeat_sender(), name="heartbeat-sender"
+        )
+
+        log.info("Waiting for vehicle heartbeat on %s ...", pymav_url)
+        try:
+            self._target_system, self._target_component = await asyncio.wait_for(
+                self._connected_future, timeout=10.0
+            )
+            self._last_heartbeat_time = time.monotonic()
+        except asyncio.TimeoutError as exc:
+            await self.disconnect()
+            raise TimeoutError("Timeout waiting for vehicle heartbeat") from exc
+        except UnsupportedVehicleError as exc:
+            await self.disconnect()
+            raise exc
+        except Exception as exc:
+            await self.disconnect()
+            raise exc
+
         try:
             await self._verify_supported_firmware()
             await self._detect_airframe()
             await self._discover_actuators()
         except (UnsupportedVehicleError, UnsupportedAirframeError) as exc:
-            self._system = None
-            self.state = VehicleState()
+            await self.disconnect()
             HUB.publish("alert", {
                 "severity": "critical", "source": "connection",
                 "text": f"Unsupported vehicle — refusing to connect: {exc}",
             })
             raise UnsupportedVehicleError(str(exc)) from exc
+        except Exception as exc:
+            log.exception("Error during connection setup")
+            await self.disconnect()
+            raise exc
 
         self.state.connected = True
         HUB.publish("connection", {"connected": True})
 
-        self._start_pymavlink_thread()
         self._watchdog = asyncio.create_task(
             self._staleness_watchdog(), name="telemetry-watchdog")
         self._conn_monitor = asyncio.create_task(
@@ -176,37 +252,36 @@ class ConnectionManager:
         return self.state
 
     async def _verify_supported_firmware(self) -> None:
-        """Reject non-PX4 stacks and PX4 firmware older than the floor.
-
-        PX4 reports its flight-stack version through the MAVSDK Info plugin.
-        ArduPilot and other autopilots either expose a different vendor or
-        no Info at all; both fail the gate. The vendor-agnostic PX4 check is
-        the HEARTBEAT.autopilot field, captured separately on the firehose —
-        this method handles the version floor.
-        """
-        # Info can lag the connection_state flip by a beat while the autopilot
-        # finishes its handshake; retry briefly before treating absence as a
-        # hard "not PX4" verdict.
-        version = None
+        """Reject non-PX4 stacks and PX4 firmware older than the floor."""
+        version_msg = None
         last_exc: Exception | None = None
-        for _ in range(5):
+        for attempt in range(5):
             try:
-                version = await self._system.info.get_version()
+                self._pending_version_read = self._loop.create_future()
+                self._pymav_conn.mav.autopilot_version_request_send(
+                    self._target_system,
+                    self._target_component
+                )
+                version_msg = await asyncio.wait_for(self._pending_version_read, timeout=2.0)
                 break
-            except Exception as exc:  # plugin not ready / unsupported / timeout
+            except Exception as exc:
                 last_exc = exc
                 await asyncio.sleep(0.5)
-        if version is None:
+            finally:
+                self._pending_version_read = None
+
+        if version_msg is None:
             raise UnsupportedVehicleError(
                 "Could not read a firmware version from the vehicle. MINT "
                 "supports PX4 "
                 f"v{config.MIN_PX4_VERSION[0]}.{config.MIN_PX4_VERSION[1]}+ "
                 f"only (underlying error: {last_exc})."
-            ) from last_exc
+            )
 
-        major = int(version.flight_sw_major)
-        minor = int(version.flight_sw_minor)
-        patch = int(version.flight_sw_patch)
+        ver = version_msg.flight_sw_version
+        major = (ver >> 24) & 0xFF
+        minor = (ver >> 16) & 0xFF
+        patch = (ver >> 8) & 0xFF
         self.state.fw_version = f"{major}.{minor}.{patch}"
 
         if (major, minor) < config.MIN_PX4_VERSION:
@@ -218,23 +293,50 @@ class ConnectionManager:
             )
         log.info("Firmware version: PX4 v%s", self.state.fw_version)
 
+    async def _heartbeat_sender(self) -> None:
+        """Periodically send a GCS heartbeat to the vehicle to keep the routing active."""
+        try:
+            while not self._stop_flag.is_set():
+                if self._pymav_conn:
+                    try:
+                        self._pymav_conn.mav.heartbeat_send(
+                            6,  # MAV_TYPE_GCS
+                            0,  # MAV_AUTOPILOT_INVALID
+                            0,  # base_mode
+                            0,  # custom_mode
+                            0   # system_status
+                        )
+                    except Exception as e:
+                        log.debug("Failed to send GCS heartbeat: %s", e)
+                await asyncio.sleep(1.0)
+        except asyncio.CancelledError:
+            pass
+
     async def disconnect(self) -> None:
-        if not self.state.connected and self._system is None:
+        if not self.state.connected and self._pymav_conn is None:
             return  # already torn down (e.g. monitor + manual disconnect race)
         self._stop_flag.set()
         if self._watchdog:
             self._watchdog.cancel()
             self._watchdog = None
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            self._heartbeat_task = None
         # Don't cancel the connection monitor if we're running inside it;
         # it will exit on its own once this coroutine returns.
         current = asyncio.current_task()
         if self._conn_monitor and self._conn_monitor is not current:
             self._conn_monitor.cancel()
         self._conn_monitor = None
+        if self._pymav_conn:
+            try:
+                self._pymav_conn.close()
+            except Exception:
+                pass
+            self._pymav_conn = None
         if self._pymav_thread:
             self._pymav_thread.join(timeout=3)
             self._pymav_thread = None
-        self._system = None
         self.state = VehicleState()
 
         # Clear proposals and cached telemetry
@@ -295,19 +397,18 @@ class ConnectionManager:
     # Control-plane liveness monitor
     # ------------------------------------------------------------------ #
     async def _connection_monitor(self) -> None:
-        """Watch the MAVSDK control plane and tear down on link loss.
+        """Watch the pymavlink heartbeat liveness and tear down on link loss.
 
         The staleness watchdog covers the data plane (firehose went quiet).
         This covers the control plane: if the vehicle reboots or the link
-        drops, MAVSDK's connection_state() reports is_connected=False. Without
-        this, the control plane keeps reporting "connected" and param reads/
-        writes would queue against a dead vehicle. On a drop we alert and run
-        the normal teardown so the UI flips to disconnected.
+        drops (no heartbeat from target for 5s), we alert and run the normal
+        teardown so the UI flips to disconnected.
         """
         try:
-            async for cs in self._system.core.connection_state():
-                if not cs.is_connected:
-                    log.warning("MAVSDK reports control link lost")
+            while True:
+                await asyncio.sleep(1.0)
+                if time.monotonic() - self._last_heartbeat_time > 5.0:
+                    log.warning("pymavlink reports control link lost (no heartbeat for 5s)")
                     HUB.publish("alert", {
                         "severity": "critical", "source": "connection",
                         "text": ("Lost the control link to the vehicle (reboot or "
@@ -326,7 +427,7 @@ class ConnectionManager:
     # ------------------------------------------------------------------ #
     async def _detect_airframe(self) -> None:
         try:
-            value = await self._system.param.get_param_int("SYS_AUTOSTART")
+            value = int(await self.read_param("SYS_AUTOSTART"))
         except Exception as exc:  # param timeout, unsupported FC, etc.
             log.warning("SYS_AUTOSTART fetch failed: %s", exc)
             HUB.publish("alert", {
@@ -368,32 +469,103 @@ class ConnectionManager:
         self.state.discovery_failed = False
         num_esc = 0
 
+        # Check if we are connected over serial
+        is_serial = False
+        try:
+            if ROUTER.is_running and ROUTER.status().mode == "serial":
+                is_serial = True
+        except Exception:
+            pass
+
+        # For parameter existence scans, one attempt is sufficient
+        scan_attempts = 1
+        scan_timeout = 1.0 if is_serial else 0.5
+
+        # On serial links, bulk-download all parameters before probing.
+        if is_serial:
+            log.info("Serial link: pre-downloading parameter cache for discovery")
+            cache = await self._bulk_download_params()
+            self._param_cache = cache if cache else None
+
         # 1. Identify active parameter family
         selected_family = None
-        families = [
-            ("ACT_FUNC", ["ACT_FUNC1"]),
-            ("SIM_GZ", ["SIM_GZ_EC_FUNC1"]),
-            ("HIL", ["HIL_ACT_FUNC1"]),
-            ("PWM", ["PWM_MAIN_FUNC1"])
-        ]
         
-        for family_name, test_params in families:
-            found = False
-            for p in test_params:
+        # Determine properties of the connected vehicle to narrow down potential families
+        is_hil = False
+        is_sim = False
+        
+        if self.state.airframe:
+            # Check if autostart ID is in _SIM_IDS
+            from .airframe import _SIM_IDS
+            if self.state.airframe.sys_autostart in _SIM_IDS:
+                is_sim = True
+                # Check if it's HIL simulation
+                label = self.state.airframe.label.lower()
+                if "hil" in label or "hil sim" in label:
+                    is_hil = True
+        
+        # Cross-check SYS_HITL parameter to be sure
+        if not is_hil:
+            try:
+                # Read SYS_HITL parameter to see if HITL is enabled on the autopilot.
+                hitl_val = await self.read_param("SYS_HITL", attempts=scan_attempts, timeout=scan_timeout)
+                if int(hitl_val) == 1:
+                    is_hil = True
+            except Exception:
+                pass
+
+        log.info("Actuator discovery - vehicle properties: is_sim=%s, is_hil=%s", is_sim, is_hil)
+
+        if is_hil:
+            selected_family = "HIL"
+        else:
+            # Check SYS_CTRL_ALLOC to determine if control allocation (ACT_FUNC) is enabled.
+            # 1 = ACT_FUNC, 0 = PWM (or SIM_GZ for simulator if present)
+            ctrl_alloc_enabled = False
+            has_ctrl_alloc_param = False
+            try:
+                ctrl_alloc = await self.read_param("SYS_CTRL_ALLOC", attempts=scan_attempts, timeout=scan_timeout)
+                has_ctrl_alloc_param = True
+                if int(ctrl_alloc) == 1:
+                    ctrl_alloc_enabled = True
+            except Exception:
+                # If SYS_CTRL_ALLOC doesn't exist, assume legacy PWM (or SITL simulator)
+                pass
+
+            if has_ctrl_alloc_param:
+                if ctrl_alloc_enabled:
+                    selected_family = "ACT_FUNC"
+                else:
+                    if is_sim:
+                        try:
+                            # Probe SIM_GZ only if it's a simulator connection
+                            await self.read_param("SIM_GZ_EC_FUNC1", attempts=scan_attempts, timeout=scan_timeout)
+                            selected_family = "SIM_GZ"
+                        except Exception:
+                            selected_family = "PWM"
+                    else:
+                        selected_family = "PWM"
+            else:
+                # Fallback: probe parameter existence sequentially if SYS_CTRL_ALLOC doesn't exist
+                # This ensures compatibility with custom/older firmware or tests.
                 try:
-                    await self.read_param(p, attempts=1)
-                    found = True
-                    break
+                    await self.read_param("ACT_FUNC1", attempts=scan_attempts, timeout=scan_timeout)
+                    selected_family = "ACT_FUNC"
                 except Exception:
-                    pass
-            if found:
-                selected_family = family_name
-                break
+                    if is_sim:
+                        try:
+                            await self.read_param("SIM_GZ_EC_FUNC1", attempts=scan_attempts, timeout=scan_timeout)
+                            selected_family = "SIM_GZ"
+                        except Exception:
+                            selected_family = "PWM"
+                    else:
+                        selected_family = "PWM"
 
         log.info("Discovered parameter family: %s", selected_family)
         if not selected_family:
             self.state.discovery_failed = True
             log.warning("Actuator auto-discovery failed: no parameter family detected.")
+            self._param_cache = None
             self._publish_airframe()
             return
 
@@ -417,7 +589,7 @@ class ConnectionManager:
                 self.state.actuator_map["control_surfaces"].append(channel_idx)
                 servo_idx = func_val - 201
                 try:
-                    cs_type = int(await self.read_param(f"CA_SV_CS{servo_idx}_TYPE", attempts=1))
+                    cs_type = int(await self.read_param(f"CA_SV_CS{servo_idx}_TYPE", attempts=scan_attempts, timeout=scan_timeout))
                     name = CS_TYPE_TO_NAME.get(cs_type, f"Surface {servo_idx + 1}")
                     self.state.actuator_names[channel_idx] = name
                 except Exception:
@@ -432,7 +604,7 @@ class ConnectionManager:
             if selected_family == "ACT_FUNC":
                 for i in range(1, 17):
                     try:
-                        val = int(await self.read_param(f"ACT_FUNC{i}"))
+                        val = int(await self.read_param(f"ACT_FUNC{i}", attempts=scan_attempts, timeout=scan_timeout))
                         if val > 0:
                             present_channels.add(i - 1)
                             await map_func(val, i - 1)
@@ -444,7 +616,7 @@ class ConnectionManager:
                 esc_values = {}
                 for i in range(1, 9):
                     try:
-                        val = int(await self.read_param(f"SIM_GZ_EC_FUNC{i}"))
+                        val = int(await self.read_param(f"SIM_GZ_EC_FUNC{i}", attempts=scan_attempts, timeout=scan_timeout))
                         esc_values[i] = val
                         if val > 0:
                             present_channels.add(i - 1)
@@ -459,12 +631,9 @@ class ConnectionManager:
                         await map_func(val, i - 1)
 
                 # Map SV functions at fixed offset 16 (instance 1 in ACTUATOR_OUTPUT_STATUS).
-                # PX4 sends EC and SV outputs as separate message instances each with
-                # their own 0-based channel index. We reserve slots 16..23 for instance 1
-                # so the two groups never overlap in the merged 32-slot array.
                 for j in range(1, 9):
                     try:
-                        val = int(await self.read_param(f"SIM_GZ_SV_FUNC{j}"))
+                        val = int(await self.read_param(f"SIM_GZ_SV_FUNC{j}", attempts=scan_attempts, timeout=scan_timeout))
                         if val > 0:
                             present_channels.add(16 + j - 1)
                             await map_func(val, 16 + j - 1)
@@ -473,7 +642,7 @@ class ConnectionManager:
             elif selected_family == "HIL":
                 for i in range(1, 17):
                     try:
-                        val = int(await self.read_param(f"HIL_ACT_FUNC{i}"))
+                        val = int(await self.read_param(f"HIL_ACT_FUNC{i}", attempts=scan_attempts, timeout=scan_timeout))
                         if val > 0:
                             present_channels.add(i - 1)
                             await map_func(val, i - 1)
@@ -482,26 +651,37 @@ class ConnectionManager:
             elif selected_family == "PWM":
                 for i in range(1, 9):
                     try:
-                        val = int(await self.read_param(f"PWM_MAIN_FUNC{i}"))
+                        val = int(await self.read_param(f"PWM_MAIN_FUNC{i}", attempts=scan_attempts, timeout=scan_timeout))
                         if val > 0:
                             present_channels.add(i - 1)
                             await map_func(val, i - 1)
                     except Exception:
                         pass
-                for j in range(1, 9):
-                    try:
-                        val = int(await self.read_param(f"PWM_AUX_FUNC{j}"))
-                        if val > 0:
-                            present_channels.add(8 + j - 1)
-                            await map_func(val, 8 + j - 1)
-                    except Exception:
-                        pass
-                # On IOMCU boards (Cube, Pixhawk 1/2) PX4 sends MAIN and AUX
-                # outputs as two separate ACTUATOR_OUTPUT_STATUS instances.
-                # SYS_USE_IO=1 means the IO board is active; on boards without
-                # IOMCU the parameter does not exist at all.
+                
+                # Check if AUX channels exist by probing PWM_AUX_FUNC1 first
+                has_aux = False
                 try:
-                    if int(await self.read_param("SYS_USE_IO", attempts=1)) == 1:
+                    val = int(await self.read_param("PWM_AUX_FUNC1", attempts=scan_attempts, timeout=scan_timeout))
+                    has_aux = True
+                    if val > 0:
+                        present_channels.add(8)
+                        await map_func(val, 8)
+                except Exception:
+                    pass
+
+                if has_aux:
+                    for j in range(2, 9):
+                        try:
+                            val = int(await self.read_param(f"PWM_AUX_FUNC{j}", attempts=scan_attempts, timeout=scan_timeout))
+                            if val > 0:
+                                present_channels.add(8 + j - 1)
+                                await map_func(val, 8 + j - 1)
+                        except Exception:
+                            pass
+
+                # Check if AUX / IO board is active
+                try:
+                    if int(await self.read_param("SYS_USE_IO", attempts=scan_attempts, timeout=scan_timeout)) == 1:
                         self.state.actuator_family = "PWM_IOMCU"
                 except Exception:
                     pass
@@ -531,8 +711,6 @@ class ConnectionManager:
 
             def normalize_to_pwm(val: float, role: str) -> float:
                 if selected_family == "SIM_GZ":
-                    # SIM_GZ parameters use the same native Gazebo scale as
-                    # ACTUATOR_OUTPUT_STATUS values — no offset needed.
                     return float(val)
                 if 800 <= val <= 2200:
                     return val
@@ -547,102 +725,115 @@ class ConnectionManager:
 
             if selected_family == "ACT_FUNC":
                 try:
-                    min_val = await self.read_param(f"OUT{ch_idx + 1}_MIN", attempts=1)
+                    min_val = await self.read_param(f"OUT{ch_idx + 1}_MIN", attempts=scan_attempts, timeout=scan_timeout)
                 except Exception:
                     pass
                 try:
-                    max_val = await self.read_param(f"OUT{ch_idx + 1}_MAX", attempts=1)
+                    max_val = await self.read_param(f"OUT{ch_idx + 1}_MAX", attempts=scan_attempts, timeout=scan_timeout)
                 except Exception:
                     pass
                 try:
-                    trim_val = await self.read_param(f"OUT{ch_idx + 1}_TRIM", attempts=1)
+                    trim_val = await self.read_param(f"OUT{ch_idx + 1}_TRIM", attempts=scan_attempts, timeout=scan_timeout)
                 except Exception:
                     pass
             elif selected_family == "SIM_GZ":
                 if ch_idx < 16:
-                    # Instance 0 — ESC group; ch_idx is 0-based slot within that instance
                     esc_idx = ch_idx + 1
                     try:
-                        min_val = await self.read_param(f"SIM_GZ_EC_MIN{esc_idx}", attempts=1)
+                        min_val = await self.read_param(f"SIM_GZ_EC_MIN{esc_idx}", attempts=scan_attempts, timeout=scan_timeout)
                     except Exception:
                         pass
                     try:
-                        max_val = await self.read_param(f"SIM_GZ_EC_MAX{esc_idx}", attempts=1)
+                        max_val = await self.read_param(f"SIM_GZ_EC_MAX{esc_idx}", attempts=scan_attempts, timeout=scan_timeout)
                     except Exception:
                         pass
                     try:
-                        trim_val = await self.read_param(f"SIM_GZ_EC_DIS{esc_idx}", attempts=1)
+                        trim_val = await self.read_param(f"SIM_GZ_EC_DIS{esc_idx}", attempts=scan_attempts, timeout=scan_timeout)
                     except Exception:
                         pass
                 else:
-                    # Instance 1 — servo group; channels start at offset 16
                     sv_idx = ch_idx - 16 + 1
                     try:
-                        min_val = await self.read_param(f"SIM_GZ_SV_MIN{sv_idx}", attempts=1)
+                        min_val = await self.read_param(f"SIM_GZ_SV_MIN{sv_idx}", attempts=scan_attempts, timeout=scan_timeout)
                     except Exception:
                         pass
                     try:
-                        max_val = await self.read_param(f"SIM_GZ_SV_MAX{sv_idx}", attempts=1)
+                        max_val = await self.read_param(f"SIM_GZ_SV_MAX{sv_idx}", attempts=scan_attempts, timeout=scan_timeout)
                     except Exception:
                         pass
                     try:
-                        trim_val = await self.read_param(f"SIM_GZ_SV_DIS{sv_idx}", attempts=1)
+                        trim_val = await self.read_param(f"SIM_GZ_SV_DIS{sv_idx}", attempts=scan_attempts, timeout=scan_timeout)
                     except Exception:
                         pass
-            elif selected_family == "PWM":
-                if ch_idx < 8:
-                    idx = ch_idx + 1
-                    try:
-                        min_val = await self.read_param(f"PWM_MAIN_MIN{idx}", attempts=1)
-                    except Exception:
-                        pass
-                    try:
-                        max_val = await self.read_param(f"PWM_MAIN_MAX{idx}", attempts=1)
-                    except Exception:
-                        pass
-                    try:
-                        trim_val = await self.read_param(f"PWM_MAIN_TRIM{idx}", attempts=1)
-                    except Exception:
-                        pass
-                else:
-                    idx = ch_idx - 7
-                    try:
-                        min_val = await self.read_param(f"PWM_AUX_MIN{idx}", attempts=1)
-                    except Exception:
-                        pass
-                    try:
-                        max_val = await self.read_param(f"PWM_AUX_MAX{idx}", attempts=1)
-                    except Exception:
-                        pass
-                    try:
-                        trim_val = await self.read_param(f"PWM_AUX_TRIM{idx}", attempts=1)
-                    except Exception:
-                        pass
+            elif selected_family in ("PWM", "PWM_IOMCU"):
+                try:
+                    min_val = await self.read_param(f"OUT{ch_idx + 1}_MIN", attempts=scan_attempts, timeout=scan_timeout)
+                except Exception:
+                    pass
+                try:
+                    max_val = await self.read_param(f"OUT{ch_idx + 1}_MAX", attempts=scan_attempts, timeout=scan_timeout)
+                except Exception:
+                    pass
+                try:
+                    trim_val = await self.read_param(f"OUT{ch_idx + 1}_TRIM", attempts=scan_attempts, timeout=scan_timeout)
+                except Exception:
+                    pass
+
+                # Legacy fallback
+                if min_val is None:
+                    if ch_idx < 8:
+                        idx = ch_idx + 1
+                        try:
+                            min_val = await self.read_param(f"PWM_MAIN_MIN{idx}", attempts=scan_attempts, timeout=scan_timeout)
+                        except Exception:
+                            pass
+                        try:
+                            max_val = await self.read_param(f"PWM_MAIN_MAX{idx}", attempts=scan_attempts, timeout=scan_timeout)
+                        except Exception:
+                            pass
+                        try:
+                            trim_val = await self.read_param(f"PWM_MAIN_TRIM{idx}", attempts=scan_attempts, timeout=scan_timeout)
+                        except Exception:
+                            pass
+                    else:
+                        idx = ch_idx - 7
+                        try:
+                            min_val = await self.read_param(f"PWM_AUX_MIN{idx}", attempts=scan_attempts, timeout=scan_timeout)
+                        except Exception:
+                            pass
+                        try:
+                            max_val = await self.read_param(f"PWM_AUX_MAX{idx}", attempts=scan_attempts, timeout=scan_timeout)
+                        except Exception:
+                            pass
+                        try:
+                            trim_val = await self.read_param(f"PWM_AUX_TRIM{idx}", attempts=scan_attempts, timeout=scan_timeout)
+                        except Exception:
+                            pass
             elif selected_family == "HIL":
                 try:
-                    min_val = await self.read_param(f"OUT{ch_idx + 1}_MIN", attempts=1)
+                    min_val = await self.read_param(f"OUT{ch_idx + 1}_MIN", attempts=scan_attempts, timeout=scan_timeout)
                 except Exception:
                     pass
                 try:
-                    max_val = await self.read_param(f"OUT{ch_idx + 1}_MAX", attempts=1)
+                    max_val = await self.read_param(f"OUT{ch_idx + 1}_MAX", attempts=scan_attempts, timeout=scan_timeout)
                 except Exception:
                     pass
                 try:
-                    trim_val = await self.read_param(f"OUT{ch_idx + 1}_TRIM", attempts=1)
+                    trim_val = await self.read_param(f"OUT{ch_idx + 1}_TRIM", attempts=scan_attempts, timeout=scan_timeout)
                 except Exception:
                     pass
                 if min_val is None and ch_idx < 8:
                     idx = ch_idx + 1
                     try:
-                        min_val = await self.read_param(f"PWM_MAIN_MIN{idx}", attempts=1)
+                        min_val = await self.read_param(f"PWM_MAIN_MIN{idx}", attempts=scan_attempts, timeout=scan_timeout)
                     except Exception:
                         pass
                     try:
-                        max_val = await self.read_param(f"PWM_MAIN_MAX{idx}", attempts=1)
+                        max_val = await self.read_param(f"PWM_MAIN_MAX{idx}", attempts=scan_attempts, timeout=scan_timeout)
                     except Exception:
                         pass
                     try:
-                        trim_val = await self.read_param(f"PWM_MAIN_TRIM{idx}", attempts=1)
+                        trim_val = await self.read_param(f"PWM_MAIN_TRIM{idx}", attempts=scan_attempts, timeout=scan_timeout)
                     except Exception:
                         pass
 
@@ -663,7 +854,44 @@ class ConnectionManager:
             for ch in sorted(classified):
                 await fetch_and_store_limits(ch)
 
+        self._param_cache = None  # release discovery cache; future reads must be live
         self._publish_airframe()
+
+    async def _bulk_download_params(self) -> dict[str, float]:
+        """Download all vehicle parameters in one PARAM_REQUEST_LIST exchange.
+
+        Returns a name→value dict on success, or an empty dict if the download
+        fails (caller falls back to individual reads).
+        """
+        if not self._pymav_conn:
+            return {}
+        try:
+            log.info("Bulk parameter download starting (this may take a few seconds on serial)...")
+            self._bulk_params = {}
+            self._bulk_param_count = -1
+            self._bulk_event = asyncio.Event()
+            self._bulk_download_active = True
+
+            # Send PARAM_REQUEST_LIST
+            self._pymav_conn.mav.param_request_list_send(
+                self._target_system,
+                self._target_component
+            )
+
+            # Wait for completion (up to 120s on slow serial links)
+            await asyncio.wait_for(self._bulk_event.wait(), timeout=120.0)
+
+            log.info("Bulk parameter download complete: %d parameters cached", len(self._bulk_params))
+            return self._bulk_params
+        except asyncio.TimeoutError:
+            log.warning("Bulk parameter download timed out; falling back to individual reads")
+            return {}
+        except Exception as exc:
+            log.warning("Bulk parameter download failed (%s); falling back to individual reads", exc)
+            return {}
+        finally:
+            self._bulk_download_active = False
+            self._bulk_event = None
 
     def _apply_mav_type(self, mav_type: int) -> None:
         """First vehicle HEARTBEAT seen (called on the event loop).
@@ -723,48 +951,66 @@ class ConnectionManager:
     # ------------------------------------------------------------------ #
     # Parameter access (control plane)
     # ------------------------------------------------------------------ #
-    async def read_param(self, name: str, attempts: int | None = None) -> float:
+    async def read_param(self, name: str, attempts: int | None = None, timeout: float | None = None) -> float:
         """Read a parameter, transparently handling float vs int storage.
 
-        MAVSDK param reads can transiently time out when the autopilot is
-        busy (flight-mode change, high CPU) — a single failure must not sink
-        a whole proposal, so the read is retried with exponential backoff.
-        We deliberately do NOT cache: the safety model re-reads the live
-        on-vehicle value at both staging and approval, so a stale cached
-        value could let an approval validate against a number the pilot has
-        since changed in QGC.
+        Param reads can transiently time out when the autopilot is busy —
+        a single failure must not sink a whole proposal, so the read is
+        retried with exponential backoff.
+        We check the cache first if populated.
         """
-        if not self._system:
+        if not self._pymav_conn:
             raise ConnectionError("Vehicle not connected")
 
+        name_upper = name.upper()
+        if self._param_cache is not None:
+            if name_upper in self._param_cache:
+                return self._param_cache[name_upper]
+            else:
+                raise KeyError(name)
+
         attempts = attempts or _PARAM_READ_ATTEMPTS
+        if timeout is None:
+            is_serial = False
+            try:
+                if ROUTER.is_running and ROUTER.status().mode == "serial":
+                    is_serial = True
+            except Exception:
+                pass
+            timeout = 2.0 if is_serial else 1.0
+
         delay = _PARAM_RETRY_BASE_S
         last_exc: Exception | None = None
+
         for attempt in range(attempts):
+            fut = self._loop.create_future()
+            self._pending_param_reads[name_upper] = fut
             try:
-                return await self._read_param_once(name)
-            except (ParamError, TimeoutError, asyncio.TimeoutError, RpcError) as exc:  # timeout / busy / rpc error
+                param_id = name_upper.encode('utf-8')
+                if len(param_id) > 16:
+                    param_id = param_id[:16]
+
+                self._pymav_conn.mav.param_request_read_send(
+                    self._target_system,
+                    self._target_component,
+                    param_id,
+                    -1  # read by name
+                )
+                
+                return await asyncio.wait_for(fut, timeout=timeout)
+            except (asyncio.TimeoutError, Exception) as exc:
                 last_exc = exc
                 if attempt < attempts - 1:
                     log.warning("Param read %s failed (attempt %d/%d): %s — retrying",
                                 name, attempt + 1, attempts, exc)
                     await asyncio.sleep(delay)
                     delay *= 2
+            finally:
+                self._pending_param_reads.pop(name_upper, None)
+
         raise TimeoutError(
             f"Could not read {name} after {attempts} attempts: {last_exc}"
         )
-
-    async def _read_param_once(self, name: str) -> float:
-        """One param read, transparently handling float vs int storage.
-
-        A float read that fails specifically because the value is stored as
-        an int is retried as an int; that type-probe is distinct from the
-        transient-timeout retry in read_param.
-        """
-        try:
-            return await self._system.param.get_param_float(name)
-        except (ParamError, RpcError):
-            return float(await self._system.param.get_param_int(name))
 
     async def write_approved_param(self, name: str, value: float,
                                    as_int: bool = False) -> None:
@@ -776,43 +1022,108 @@ class ConnectionManager:
         API layer to have done the safety pass (it does it twice).
         `as_int` comes from the registry's type annotation.
         """
-        if not self._system:
+        if not self._pymav_conn:
             raise ConnectionError("Vehicle not connected")
+
+        name_upper = name.upper()
+        param_id = name_upper.encode('utf-8')
+        if len(param_id) > 16:
+            param_id = param_id[:16]
+
         if as_int:
-            await self._system.param.set_param_int(name, int(round(value)))
+            int_val = int(round(value))
+            float_val = struct.unpack('f', struct.pack('i', int_val))[0]
+            param_type = 6  # MAV_PARAM_TYPE_INT32
         else:
-            await self._system.param.set_param_float(name, value)
-        log.info("Parameter written: %s = %s", name, value)
-        HUB.publish("param_written", {"param": name, "value": value})
+            float_val = value
+            param_type = 9  # MAV_PARAM_TYPE_REAL32
+
+        attempts = 3
+        timeout = 1.0
+        delay = 0.2
+        last_exc: Exception | None = None
+
+        for attempt in range(attempts):
+            fut = self._loop.create_future()
+            self._pending_param_writes[name_upper] = fut
+            try:
+                self._pymav_conn.mav.param_set_send(
+                    self._target_system,
+                    self._target_component,
+                    param_id,
+                    float_val,
+                    param_type
+                )
+                
+                confirmed_val = await asyncio.wait_for(fut, timeout=timeout)
+                log.info("Parameter written: %s = %s (confirmed: %s)", name, value, confirmed_val)
+                HUB.publish("param_written", {"param": name, "value": value})
+                return
+            except (asyncio.TimeoutError, Exception) as exc:
+                last_exc = exc
+                if attempt < attempts - 1:
+                    log.warning("Param write %s failed (attempt %d/%d): %s — retrying",
+                                name, attempt + 1, attempts, exc)
+                    await asyncio.sleep(delay)
+                    delay *= 2
+            finally:
+                self._pending_param_writes.pop(name_upper, None)
+
+        raise TimeoutError(
+            f"Could not write parameter {name} = {value} after {attempts} attempts: {last_exc}"
+        )
 
     # ------------------------------------------------------------------ #
     # Raw firehose (data plane, dedicated thread)
     # ------------------------------------------------------------------ #
     def _request_message_intervals(self, conn, target_system: int, target_component: int) -> None:
-        log.info("Requesting telemetry stream intervals from System %d, Component %d", target_system, target_component)
-        # Message intervals: key: message_id, value: interval in microseconds
-        # ATTITUDE (30): 20 Hz (50,000 us)
-        # ATTITUDE_TARGET (83): 10 Hz (100,000 us)
-        # LOCAL_POSITION_NED (32): 10 Hz (100,000 us)
-        # POSITION_TARGET_LOCAL_NED (85): 10 Hz (100,000 us)
-        # EKF_STATUS_REPORT (193): 5 Hz (200,000 us)
-        # ESTIMATOR_STATUS (230): 5 Hz (200,000 us)
-        # VIBRATION (241): 5 Hz (200,000 us)
-        # SERVO_OUTPUT_RAW (36): 10 Hz (100,000 us)
-        # ACTUATOR_OUTPUT_STATUS (375): 10 Hz (100,000 us)
-        # VFR_HUD (74): 5 Hz (200,000 us)
-        intervals = {
-            30: 50000,    # ATTITUDE
-            83: 100000,   # ATTITUDE_TARGET
-            32: 100000,   # LOCAL_POSITION_NED
-            85: 100000,   # POSITION_TARGET_LOCAL_NED
-            193: 200000,  # EKF_STATUS_REPORT
-            230: 200000,  # ESTIMATOR_STATUS
-            241: 200000,  # VIBRATION
-            36: 100000,   # SERVO_OUTPUT_RAW
-            375: 100000,  # ACTUATOR_OUTPUT_STATUS
-            74: 200000,   # VFR_HUD
-        }
+        is_serial = False
+        try:
+            if ROUTER.is_running and ROUTER.status().mode == "serial":
+                is_serial = True
+        except Exception:
+            pass
+
+        if is_serial:
+            log.info("Serial link: scaling down requested telemetry streams to conserve bandwidth")
+            # Downsampled rates for low-bandwidth serial modems (total ~24 Hz vs ~90 Hz)
+            intervals = {
+                30: 100000,   # ATTITUDE: 10 Hz
+                83: 500000,   # ATTITUDE_TARGET: 2 Hz
+                32: 500000,   # LOCAL_POSITION_NED: 2 Hz
+                85: 500000,   # POSITION_TARGET_LOCAL_NED: 2 Hz
+                193: 1000000, # EKF_STATUS_REPORT: 1 Hz
+                230: 1000000, # ESTIMATOR_STATUS: 1 Hz
+                241: 1000000, # VIBRATION: 1 Hz
+                36: 500000,   # SERVO_OUTPUT_RAW: 2 Hz
+                375: 500000,  # ACTUATOR_OUTPUT_STATUS: 2 Hz
+                74: 1000000,  # VFR_HUD: 1 Hz
+            }
+        else:
+            log.info("High-bandwidth link: requesting full-rate telemetry streams")
+            # Message intervals: key: message_id, value: interval in microseconds
+            # ATTITUDE (30): 20 Hz (50,000 us)
+            # ATTITUDE_TARGET (83): 10 Hz (100,000 us)
+            # LOCAL_POSITION_NED (32): 10 Hz (100,000 us)
+            # POSITION_TARGET_LOCAL_NED (85): 10 Hz (100,000 us)
+            # EKF_STATUS_REPORT (193): 5 Hz (200,000 us)
+            # ESTIMATOR_STATUS (230): 5 Hz (200,000 us)
+            # VIBRATION (241): 5 Hz (200,000 us)
+            # SERVO_OUTPUT_RAW (36): 10 Hz (100,000 us)
+            # ACTUATOR_OUTPUT_STATUS (375): 10 Hz (100,000 us)
+            # VFR_HUD (74): 5 Hz (200,000 us)
+            intervals = {
+                30: 50000,    # ATTITUDE
+                83: 100000,   # ATTITUDE_TARGET
+                32: 100000,   # LOCAL_POSITION_NED
+                85: 100000,   # POSITION_TARGET_LOCAL_NED
+                193: 200000,  # EKF_STATUS_REPORT
+                230: 200000,  # ESTIMATOR_STATUS
+                241: 200000,  # VIBRATION
+                36: 100000,   # SERVO_OUTPUT_RAW
+                375: 100000,  # ACTUATOR_OUTPUT_STATUS
+                74: 200000,   # VFR_HUD
+            }
         for msg_id, interval_us in intervals.items():
             if self._stop_flag.is_set():
                 break
@@ -844,24 +1155,23 @@ class ConnectionManager:
 
     def _pymavlink_worker(self) -> None:
         """Blocking receive loop. Publishes into the hub thread-safely."""
-        try:
-            conn = mavutil.mavlink_connection(
-                f"udpin:127.0.0.1:{ROUTER.pymavlink_port}"
-            )
-            import socket
-            try:
-                conn.port.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
-                log.info("Set pymavlink UDP socket receive buffer to 1MB")
-            except Exception as e:
-                log.warning("Failed to set pymavlink UDP socket RCVBUF: %s", e)
-        except OSError as exc:
-            log.error("pymavlink bind failed: %s", exc)
+        conn = self._pymav_conn
+        if not conn:
+            log.error("pymavlink worker started without an active connection")
             return
 
         rates_requested = False
 
         while not self._stop_flag.is_set():
-            msg = conn.recv_match(blocking=True, timeout=1.0)
+            try:
+                msg = conn.recv_match(blocking=True, timeout=1.0)
+            except Exception as e:
+                if self._stop_flag.is_set():
+                    break
+                log.debug("Error in recv_match: %s", e)
+                time.sleep(0.1)
+                continue
+
             if msg is None:
                 continue
             mtype = msg.get_type()
@@ -870,7 +1180,6 @@ class ConnectionManager:
             # continuous flight-mode tracking (ignore other GCS on the link).
             if mtype == "HEARTBEAT" and msg.type != _MAV_TYPE_GCS:
                 # PX4-only gate: a non-PX4 autopilot on the link is refused.
-                # The version floor is checked separately via MAVSDK Info.
                 if msg.autopilot != config.MAV_AUTOPILOT_PX4:
                     if not self._autopilot_rejected:
                         self._autopilot_rejected = True
@@ -882,6 +1191,16 @@ class ConnectionManager:
                                 f"MINT supports PX4 only.",
                             )
                     continue
+
+                self._last_heartbeat_time = time.monotonic()
+
+                if self._connected_future and not self._connected_future.done():
+                    target_sys = msg.get_srcSystem()
+                    target_comp = msg.get_srcComponent()
+                    self._loop.call_soon_threadsafe(
+                        _safe_set_result, self._connected_future, (target_sys, target_comp)
+                    )
+
                 if not rates_requested:
                     rates_requested = True
                     target_sys = msg.get_srcSystem()
@@ -892,10 +1211,12 @@ class ConnectionManager:
                         name="telemetry-rate-request",
                         daemon=True
                     ).start()
+
                 if not self._mav_type_seen:
                     self._mav_type_seen = True
                     if self._loop and self._loop.is_running():
                         self._loop.call_soon_threadsafe(self._apply_mav_type, msg.type)
+
                 armed = bool(msg.base_mode & 0x80)
                 if (msg.custom_mode, armed) != self._last_mode:
                     self._last_mode = (msg.custom_mode, armed)
@@ -909,6 +1230,38 @@ class ConnectionManager:
                             HUB.publish, "flight_mode", payload)
                 continue
 
+            if mtype == "PARAM_VALUE":
+                pid = msg.param_id
+                if isinstance(pid, bytes):
+                    try:
+                        pid = pid.decode('utf-8')
+                    except Exception:
+                        pid = str(pid)
+                pid = pid.replace('\x00', '').strip()
+                pid_upper = pid.upper()
+                
+                val = _extract_param_value(msg)
+                
+                if self._bulk_download_active:
+                    self._bulk_params[pid_upper] = val
+                    self._bulk_param_count = msg.param_count
+                    if len(self._bulk_params) >= self._bulk_param_count and self._bulk_event:
+                        self._loop.call_soon_threadsafe(self._bulk_event.set)
+                
+                if pid_upper in self._pending_param_reads:
+                    fut = self._pending_param_reads.get(pid_upper)
+                    if fut and not fut.done():
+                        self._loop.call_soon_threadsafe(_safe_set_result, fut, val)
+                
+                if pid_upper in self._pending_param_writes:
+                    fut = self._pending_param_writes.get(pid_upper)
+                    if fut and not fut.done():
+                        self._loop.call_soon_threadsafe(_safe_set_result, fut, val)
+
+            elif mtype == "AUTOPILOT_VERSION":
+                if self._pending_version_read and not self._pending_version_read.done():
+                    self._loop.call_soon_threadsafe(_safe_set_result, self._pending_version_read, msg)
+
             channel = _WATCHED_MESSAGES.get(mtype)
             if channel is None:
                 continue
@@ -917,8 +1270,6 @@ class ConnectionManager:
             # Cross the thread boundary into asyncio land.
             if self._loop and self._loop.is_running():
                 self._loop.call_soon_threadsafe(HUB.publish, channel, payload)
-
-        conn.close()
 
 
 CONNECTION = ConnectionManager()

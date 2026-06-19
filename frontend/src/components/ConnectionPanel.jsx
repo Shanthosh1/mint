@@ -146,8 +146,7 @@ export default function ConnectionPanel() {
 
   // PX4 SITL preset: SITL's offboard/API stream targets localhost:14540.
   // We listen there; QGC keeps its own direct 14550 stream from SITL, so
-  // the backend automatically skips QGC forwarding and shifts MAVSDK to
-  // an alternate port.
+  // the backend automatically skips QGC forwarding.
   const applySitlPreset = () => {
     setMode('udp_listen');
     setNetHost('0.0.0.0');

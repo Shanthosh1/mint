@@ -728,7 +728,7 @@ class TestNewTuningImprovements(unittest.IsolatedAsyncioTestCase):
         
         conn = ConnectionManager()
         conn.state = VehicleState()
-        conn._system = MagicMock()
+        conn._pymav_conn = MagicMock()
         
         params = {
             "ACT_FUNC1": 101,  # Motor 1
@@ -747,7 +747,7 @@ class TestNewTuningImprovements(unittest.IsolatedAsyncioTestCase):
             "CA_SV_CS1_TYPE": 3.0,  # Elevator
         }
         
-        async def mock_read_param(name, attempts=None):
+        async def mock_read_param(name, attempts=None, timeout=None):
             if name in params:
                 return float(params[name])
             raise Exception("Param not found")
@@ -774,6 +774,53 @@ class TestNewTuningImprovements(unittest.IsolatedAsyncioTestCase):
             # Verify discovered actuator names
             self.assertEqual(conn.state.actuator_names[2], "Left Aileron")
             self.assertEqual(conn.state.actuator_names[3], "Elevator")
+
+    async def test_connection_param_caching_read_from_cache(self):
+        from backend.app.mavlink.connection import ConnectionManager
+        conn = ConnectionManager()
+        conn._pymav_conn = MagicMock()
+        conn._param_cache = {"SYS_AUTOSTART": 4001.0, "SYS_CTRL_ALLOC": 1.0}
+        
+        # Test cache hit
+        val = await conn.read_param("SYS_AUTOSTART")
+        self.assertEqual(val, 4001.0)
+        
+        # Test cache miss (should raise KeyError immediately without calling system)
+        with self.assertRaises(KeyError):
+            await conn.read_param("NON_EXISTENT_PARAM")
+
+    async def test_connection_bulk_download_success(self):
+        from backend.app.mavlink.connection import ConnectionManager
+        conn = ConnectionManager()
+        conn._pymav_conn = MagicMock()
+        conn._target_system = 1
+        conn._target_component = 1
+        
+        def mock_request_list(*args, **kwargs):
+            conn._bulk_params = {"FLOAT_PARAM": 1.23, "INT_PARAM": 42.0}
+            conn._bulk_event.set()
+            
+        conn._pymav_conn.mav.param_request_list_send = mock_request_list
+        
+        cache = await conn._bulk_download_params()
+        self.assertEqual(cache["FLOAT_PARAM"], 1.23)
+        self.assertEqual(cache["INT_PARAM"], 42.0)
+        
+    async def test_connection_bulk_download_timeout_fallback(self):
+        from backend.app.mavlink.connection import ConnectionManager
+        conn = ConnectionManager()
+        conn._pymav_conn = MagicMock()
+        conn._target_system = 1
+        conn._target_component = 1
+        
+        async def mock_wait_for(fut, timeout):
+            if hasattr(fut, "close"):
+                fut.close()
+            raise asyncio.TimeoutError()
+            
+        with patch("asyncio.wait_for", side_effect=mock_wait_for):
+            cache = await conn._bulk_download_params()
+            self.assertEqual(cache, {})
 
     def test_vibration_gate_hysteresis(self):
         from backend.app.analysis.vibration_live import VIB_GATE

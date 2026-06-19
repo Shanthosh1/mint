@@ -99,6 +99,11 @@ def scan_serial_ports() -> list[SerialPortInfo]:
     """
     ports: list[SerialPortInfo] = []
     for p in list_ports.comports():
+        # Filter out legacy/dummy motherboard ports on Linux that have no hardware attached
+        if platform.system() == "Linux":
+            if p.description == "n/a" and p.hwid == "n/a":
+                continue
+
         permission_ok = True
         if platform.system() == "Linux":
             permission_ok = _can_open(p.device)

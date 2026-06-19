@@ -76,7 +76,6 @@ HTTP_PORT = int(_get_val("server.http_port", 8400))
 # Telemetry routing endpoints (all loopback)
 # ---------------------------------------------------------------------------
 QGC_UDP_PORT = int(_get_val("mavlink.qgc_udp_port", 14550))        # QGroundControl
-MAVSDK_UDP_PORT = int(_get_val("mavlink.mavsdk_udp_port", 14540))  # MAVSDK-Python (params, actions)
 PYMAVLINK_UDP_PORT = int(_get_val("mavlink.pymavlink_udp_port", 14541))  # raw message firehose
 DEFAULT_BAUD = int(_get_val("mavlink.default_baud", 57600))
 
